@@ -7,6 +7,7 @@ about failing in plain language when that is not possible.
 
 from __future__ import annotations
 
+import contextlib
 import signal
 from types import FrameType
 
@@ -17,10 +18,18 @@ from jarvis import factory
 from jarvis.audit import AuditLog
 from jarvis.config import Config
 from jarvis.errors import JarvisError
+from jarvis.interfaces.agent import (
+    AgentFailed,
+    Brain,
+    SentenceComplete,
+    TextDelta,
+    TurnFinished,
+)
 from jarvis.interfaces.audio import AudioOutput
 from jarvis.interfaces.stt import Transcript
+from jarvis.interfaces.tts import SpeechSynthesizer
 from jarvis.logging_setup import get_logger
-from jarvis.loop import Responder, TurnResult, VoiceLoop, echo_responder
+from jarvis.loop import TurnResult, VoiceLoop
 from jarvis.state import State
 
 log = get_logger("runner")
@@ -34,11 +43,12 @@ _STATE_STYLE = {
 }
 
 
-def run_voice(cfg: Config, console: Console, *, responder: Responder = echo_responder) -> int:
+def run_voice(cfg: Config, console: Console, *, brain: Brain | None = None) -> int:
     """Run the wake-word voice loop until interrupted."""
     audit = AuditLog(cfg.logging.audit_file)
 
     try:
+        thinker = brain if brain is not None else factory.build_brain(cfg)
         synthesizer = factory.build_synthesizer(cfg)
         synthesizer.load()
 
@@ -60,8 +70,8 @@ def run_voice(cfg: Config, console: Console, *, responder: Responder = echo_resp
         wake_word=wake_word,
         transcriber=transcriber,
         synthesizer=synthesizer,
+        brain=thinker,
         audit=audit,
-        responder=responder,
         on_state=lambda state: _print_state(console, state),
         on_turn=lambda turn: _print_turn(console, turn),
     )
@@ -87,7 +97,7 @@ def run_voice(cfg: Config, console: Console, *, responder: Responder = echo_resp
     return 0
 
 
-def run_text(cfg: Config, console: Console, *, responder: Responder = echo_responder) -> int:
+def run_text(cfg: Config, console: Console, *, brain: Brain | None = None) -> int:
     """Run the text REPL: type instead of talking, but still hear the reply.
 
     This exists so the rest of the pipeline can be developed without a
@@ -96,6 +106,11 @@ def run_text(cfg: Config, console: Console, *, responder: Responder = echo_respo
     """
     audit = AuditLog(cfg.logging.audit_file)
     audio_out: AudioOutput | None = None
+
+    try:
+        thinker = brain if brain is not None else factory.build_brain(cfg)
+    except JarvisError as exc:
+        return _report(console, exc)
 
     try:
         synthesizer = factory.build_synthesizer(cfg)
@@ -137,18 +152,7 @@ def run_text(cfg: Config, console: Console, *, responder: Responder = echo_respo
                 break
 
             audit.record("turn.transcribed", outcome="ok", detail=line, source="text")
-            reply = responder(line)
-
-            console.print(Text(f"{cfg.general.name.lower()} > ", style="bold green"), end="")
-            console.print(reply)
-
-            if audio_out is not None:
-                try:
-                    clip = synthesizer.synthesize(reply)
-                    audio_out.play(clip)
-                    audio_out.wait_until_done(timeout=clip.duration_seconds + 5.0)
-                except JarvisError as exc:
-                    console.print(Text(f"  (could not speak: {exc.message})", style="yellow"))
+            _run_text_turn(cfg, console, thinker, synthesizer, audio_out, audit, line)
             console.print()
     finally:
         if audio_out is not None:
@@ -174,6 +178,70 @@ def say(cfg: Config, console: Console, text: str) -> int:
 
     console.print(Text(f"  Spoke {clip.duration_seconds:.1f}s of audio.", style="dim"))
     return 0
+
+
+def _run_text_turn(
+    cfg: Config,
+    console: Console,
+    brain: Brain,
+    synthesizer: SpeechSynthesizer,
+    audio_out: AudioOutput | None,
+    audit: AuditLog,
+    line: str,
+) -> None:
+    """One typed exchange, streamed to the terminal and spoken sentence by sentence.
+
+    Text mode runs the same brain and the same event stream as voice mode, so
+    what you hear here is what you would hear standing in the room. Only the
+    input differs.
+    """
+    console.print(Text(f"{cfg.general.name.lower()} > ", style="bold green"), end="")
+    wrote_text = False
+
+    for event in brain.respond(line):
+        if isinstance(event, TextDelta):
+            # Print as it streams, so text mode shows the same incremental
+            # arrival that voice mode turns into early speech.
+            console.print(event.text, end="", markup=False, highlight=False)
+            wrote_text = True
+
+        elif isinstance(event, SentenceComplete):
+            if audio_out is not None:
+                try:
+                    audio_out.play(synthesizer.synthesize(event.text))
+                except JarvisError as exc:
+                    console.print(Text(f"\n  (could not speak: {exc.message})", style="yellow"))
+
+        elif isinstance(event, AgentFailed):
+            if wrote_text:
+                console.print()
+            console.print(Text(event.spoken, style="yellow"))
+            _print_remedy(console, event.detail)
+            wrote_text = True
+            if audio_out is not None:
+                with contextlib.suppress(JarvisError):
+                    audio_out.play(synthesizer.synthesize(event.spoken))
+
+        elif isinstance(event, TurnFinished):
+            audit.record(
+                "turn.replied", outcome="ok", detail=event.text, source="text", **event.usage
+            )
+
+    console.print()
+    if audio_out is not None:
+        audio_out.wait_until_done(timeout=120.0)
+
+
+def _print_remedy(console: Console, detail: str) -> None:
+    """Show the `Try: ...` line from a JarvisError under a spoken apology.
+
+    What is said aloud has to stay short. The instruction that actually fixes it
+    belongs on screen, where it can be read and copied.
+    """
+    for line in detail.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Try:"):
+            console.print(Text(f"  {stripped}", style="dim"))
 
 
 # --------------------------------------------------------------------------- #

@@ -10,11 +10,20 @@ from __future__ import annotations
 import shutil
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
 
 from jarvis.config import Config
+from jarvis.interfaces.agent import (
+    AgentEvent,
+    AgentFailed,
+    Brain,
+    SentenceComplete,
+    TextDelta,
+    TurnFinished,
+)
 from jarvis.interfaces.audio import (
     AudioClip,
     AudioInput,
@@ -25,6 +34,7 @@ from jarvis.interfaces.audio import (
 from jarvis.interfaces.stt import Transcriber, Transcript
 from jarvis.interfaces.tts import SpeechSynthesizer
 from jarvis.interfaces.wake_word import WakeEvent, WakeWordDetector
+from jarvis.tts.sentences import split_sentences
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SHIPPED_CONFIG = REPO_ROOT / "config.yaml"
@@ -271,6 +281,58 @@ class FakeSynthesizer(SpeechSynthesizer):
     def synthesize(self, text: str) -> AudioClip:
         self.spoken.append(text)
         return AudioClip(np.full(max(1, len(text)), 0.1, dtype=np.float32), self._sample_rate)
+
+
+class FakeBrain(Brain):
+    """Replies from a script, streamed one sentence at a time.
+
+    Mirrors the real brain's event order exactly -- deltas, then a
+    SentenceComplete per sentence, then TurnFinished -- so a test that passes
+    here is testing the loop, not the fake.
+    """
+
+    def __init__(
+        self,
+        replies: list[str] | None = None,
+        *,
+        fail_with: str | None = None,
+    ) -> None:
+        self._replies = list(replies or ["The time is twenty past three."])
+        self._fail_with = fail_with
+        self.asked: list[str] = []
+        self.resets = 0
+        self._messages: list[dict[str, Any]] = []
+
+    @property
+    def history(self) -> list[dict[str, Any]]:
+        return list(self._messages)
+
+    def reset(self) -> None:
+        self.resets += 1
+        self._messages.clear()
+
+    def confirm(self, call_id: str, approved: bool) -> None:
+        raise NotImplementedError
+
+    def respond(self, user_text: str) -> Iterator[AgentEvent]:
+        self.asked.append(user_text)
+
+        if self._fail_with is not None:
+            yield AgentFailed(spoken=self._fail_with, detail="scripted failure")
+            return
+
+        reply = self._replies.pop(0) if self._replies else ""
+        if not reply:
+            yield TurnFinished(text="", stop_reason="empty")
+            return
+
+        yield TextDelta(text=reply)
+        for sentence in split_sentences(reply):
+            yield SentenceComplete(text=sentence)
+
+        self._messages.append({"role": "user", "content": user_text})
+        self._messages.append({"role": "assistant", "content": reply})
+        yield TurnFinished(text=reply, stop_reason="end_turn", usage={"output_tokens": 7})
 
 
 # --------------------------------------------------------------------------- #

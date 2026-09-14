@@ -15,12 +15,13 @@ from jarvis.config import Config
 from jarvis.errors import ModelMissingError
 from jarvis.interfaces.audio import AudioClip, Samples
 from jarvis.interfaces.stt import Transcript
-from jarvis.loop import Responder, TurnResult, VoiceLoop, echo_responder
+from jarvis.loop import TurnResult, VoiceLoop
 from jarvis.state import State
 
 from .conftest import (
     FakeAudioInput,
     FakeAudioOutput,
+    FakeBrain,
     FakeSynthesizer,
     FakeTranscriber,
     FakeWakeWord,
@@ -35,7 +36,7 @@ def build_loop(
     *,
     wake_on: set[int] | None = None,
     transcripts: list[str] | None = None,
-    responder: Responder = echo_responder,
+    brain: FakeBrain | None = None,
     transcriber: FakeTranscriber | None = None,
     synthesizer: FakeSynthesizer | None = None,
 ) -> tuple[VoiceLoop, dict[str, object]]:
@@ -45,6 +46,7 @@ def build_loop(
         "wake_word": FakeWakeWord(wake_on if wake_on is not None else {0}),
         "transcriber": transcriber or FakeTranscriber(transcripts),
         "synthesizer": synthesizer or FakeSynthesizer(),
+        "brain": brain if brain is not None else FakeBrain(["Very good, sir."]),
     }
     states: list[State] = []
     turns: list[TurnResult] = []
@@ -55,8 +57,8 @@ def build_loop(
         wake_word=parts["wake_word"],  # type: ignore[arg-type]
         transcriber=parts["transcriber"],  # type: ignore[arg-type]
         synthesizer=parts["synthesizer"],  # type: ignore[arg-type]
+        brain=parts["brain"],  # type: ignore[arg-type]
         audit=NullAuditLog(),
-        responder=responder,
         on_state=states.append,
         on_turn=turns.append,
     )
@@ -72,13 +74,17 @@ def command_audio(utterance: list[Samples]) -> list[Samples]:
 
 
 class TestHappyPath:
-    def test_wake_record_transcribe_speak(self, cfg: Config, command_audio: list[Samples]) -> None:
-        loop, parts = build_loop(cfg, command_audio, transcripts=["what time is it"])
+    def test_wake_record_transcribe_think_speak(
+        self, cfg: Config, command_audio: list[Samples]
+    ) -> None:
+        brain = FakeBrain(["The time is twenty past three."])
+        loop, parts = build_loop(cfg, command_audio, transcripts=["what time is it"], brain=brain)
         loop.run()
 
+        assert brain.asked == ["what time is it"]
         synth = parts["synthesizer"]
         assert isinstance(synth, FakeSynthesizer)
-        assert synth.spoken == ["what time is it"]
+        assert synth.spoken == ["The time is twenty past three."]
 
     def test_it_visits_every_state_in_order(
         self, cfg: Config, command_audio: list[Samples]
@@ -94,7 +100,9 @@ class TestHappyPath:
         ]
 
     def test_the_reply_is_played(self, cfg: Config, command_audio: list[Samples]) -> None:
-        loop, parts = build_loop(cfg, command_audio, transcripts=["hello"])
+        loop, parts = build_loop(
+            cfg, command_audio, transcripts=["hello"], brain=FakeBrain(["Good evening."])
+        )
         loop.run()
         out = parts["audio_out"]
         assert isinstance(out, FakeAudioOutput)
@@ -111,35 +119,158 @@ class TestHappyPath:
         assert transcriber.calls[0].duration_seconds > 0.5
 
     def test_it_reports_the_turn(self, cfg: Config, command_audio: list[Samples]) -> None:
-        loop, parts = build_loop(cfg, command_audio, transcripts=["good evening"])
+        loop, parts = build_loop(
+            cfg,
+            command_audio,
+            transcripts=["good evening"],
+            brain=FakeBrain(["And a good evening to you."]),
+        )
         loop.run()
         turns = parts["turns"]
         assert isinstance(turns, list)
         assert len(turns) == 1
         assert turns[0].transcript is not None
         assert turns[0].transcript.text == "good evening"
-        assert turns[0].reply == "good evening"
+        assert turns[0].reply == "And a good evening to you."
         assert turns[0].outcome is RecordingOutcome.COMPLETE
+        assert turns[0].failed is False
 
 
-class TestMilestoneTwoBehaviour:
-    def test_the_echo_responder_speaks_the_transcript_verbatim(self) -> None:
-        """Echoing is what proves the audio path independently of the brain."""
-        assert echo_responder("set a timer for ten minutes") == "set a timer for ten minutes"
+class TestSentenceBySentenceSpeech:
+    """The point of milestone 3: speak sentence one while sentence three is
+    still being generated."""
 
-    def test_a_custom_responder_is_all_milestone_3_needs(
+    def test_each_sentence_is_synthesised_separately(
         self, cfg: Config, command_audio: list[Samples]
     ) -> None:
-        loop, parts = build_loop(
-            cfg,
-            command_audio,
-            transcripts=["hello"],
-            responder=lambda text: f"Good evening. You said: {text}",
+        brain = FakeBrain(["Good evening. The kettle is on. Anything else?"])
+        loop, parts = build_loop(cfg, command_audio, brain=brain)
+        loop.run()
+
+        synth = parts["synthesizer"]
+        assert isinstance(synth, FakeSynthesizer)
+        assert synth.spoken == [
+            "Good evening.",
+            "The kettle is on.",
+            "Anything else?",
+        ]
+
+    def test_each_sentence_is_queued_as_its_own_clip(
+        self, cfg: Config, command_audio: list[Samples]
+    ) -> None:
+        """Separate clips are what let playback start before generation ends."""
+        brain = FakeBrain(["One. Two. Three."])
+        loop, parts = build_loop(cfg, command_audio, brain=brain)
+        loop.run()
+
+        out = parts["audio_out"]
+        assert isinstance(out, FakeAudioOutput)
+        assert len(out.played) == 3
+
+    def test_speaking_starts_before_the_turn_finishes(
+        self, cfg: Config, command_audio: list[Samples]
+    ) -> None:
+        """The state must flip to SPEAKING on the first sentence, not the last."""
+        observed: list[tuple[State, int]] = []
+
+        class WatchingSynth(FakeSynthesizer):
+            def synthesize(self, text: str) -> AudioClip:
+                observed.append((loop.state, len(self.spoken)))
+                return super().synthesize(text)
+
+        synth = WatchingSynth()
+        loop, _ = build_loop(
+            cfg, command_audio, brain=FakeBrain(["One. Two. Three."]), synthesizer=synth
         )
+        loop.run()
+
+        assert observed[0][0] is State.SPEAKING
+        assert observed[0][1] == 0  # the very first sentence
+
+    def test_a_single_sentence_reply_still_works(
+        self, cfg: Config, command_audio: list[Samples]
+    ) -> None:
+        loop, parts = build_loop(cfg, command_audio, brain=FakeBrain(["Certainly."]))
         loop.run()
         synth = parts["synthesizer"]
         assert isinstance(synth, FakeSynthesizer)
-        assert synth.spoken == ["Good evening. You said: hello"]
+        assert synth.spoken == ["Certainly."]
+
+    def test_an_unterminated_reply_is_still_spoken(
+        self, cfg: Config, command_audio: list[Samples]
+    ) -> None:
+        """A reply with no full stop must not be silently swallowed."""
+        loop, parts = build_loop(cfg, command_audio, brain=FakeBrain(["no full stop here"]))
+        loop.run()
+        synth = parts["synthesizer"]
+        assert isinstance(synth, FakeSynthesizer)
+        assert synth.spoken == ["no full stop here"]
+
+
+class TestBrainFailure:
+    def test_a_failure_is_spoken_aloud(self, cfg: Config, command_audio: list[Samples]) -> None:
+        """Silence would leave the user wondering whether it heard them at all."""
+        brain = FakeBrain(fail_with="I can't reach the network just now.")
+        loop, parts = build_loop(cfg, command_audio, brain=brain)
+        loop.run()
+
+        synth = parts["synthesizer"]
+        assert isinstance(synth, FakeSynthesizer)
+        assert synth.spoken == ["I can't reach the network just now."]
+
+    def test_a_failure_is_marked_on_the_turn(
+        self, cfg: Config, command_audio: list[Samples]
+    ) -> None:
+        brain = FakeBrain(fail_with="Something went wrong.")
+        loop, parts = build_loop(cfg, command_audio, brain=brain)
+        loop.run()
+
+        turns = parts["turns"]
+        assert isinstance(turns, list)
+        assert turns[0].failed is True
+
+    def test_it_returns_to_idle_after_a_failure(
+        self, cfg: Config, command_audio: list[Samples]
+    ) -> None:
+        """One bad turn must not end the session."""
+        brain = FakeBrain(fail_with="Something went wrong.")
+        loop, _ = build_loop(cfg, command_audio, brain=brain)
+        loop.run()
+        assert loop.state is State.STOPPED  # reached via IDLE
+
+    def test_an_empty_reply_is_not_spoken(self, cfg: Config, command_audio: list[Samples]) -> None:
+        loop, parts = build_loop(cfg, command_audio, brain=FakeBrain([""]))
+        loop.run()
+        synth = parts["synthesizer"]
+        assert isinstance(synth, FakeSynthesizer)
+        assert synth.spoken == []
+
+    def test_a_synthesis_failure_does_not_stop_the_turn(
+        self, cfg: Config, command_audio: list[Samples]
+    ) -> None:
+        class BrokenSynth(FakeSynthesizer):
+            def synthesize(self, text: str) -> AudioClip:
+                raise ModelMissingError("voice gone", remedy="download it")
+
+        loop, parts = build_loop(
+            cfg, command_audio, brain=FakeBrain(["Hello."]), synthesizer=BrokenSynth()
+        )
+        loop.run()  # must not raise
+
+        turns = parts["turns"]
+        assert isinstance(turns, list)
+        assert turns[0].reply == "Hello."
+
+
+class TestStreamingCallbacks:
+    def test_text_deltas_are_reported_for_live_display(
+        self, cfg: Config, command_audio: list[Samples]
+    ) -> None:
+        deltas: list[str] = []
+        loop, _ = build_loop(cfg, command_audio, brain=FakeBrain(["Good evening."]))
+        loop._on_reply_delta = deltas.append
+        loop.run()
+        assert "".join(deltas) == "Good evening."
 
 
 class TestIdleBehaviour:
@@ -249,11 +380,12 @@ class TestMultipleTurns:
             blocks,
             wake_on={0, 1},
             transcripts=["first question", "second question"],
+            brain=FakeBrain(["First answer.", "Second answer."]),
         )
         loop.run()
         synth = parts["synthesizer"]
         assert isinstance(synth, FakeSynthesizer)
-        assert synth.spoken == ["first question", "second question"]
+        assert synth.spoken == ["First answer.", "Second answer."]
 
 
 class TestStopping:

@@ -19,7 +19,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
-from jarvis import __version__, runner
+from jarvis import __version__, factory, runner
 from jarvis.audit import AuditLog
 from jarvis.config import Config
 from jarvis.errors import JarvisError
@@ -51,6 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  python -m jarvis                 run the health check\n"
             "  python -m jarvis run             start listening for the wake word\n"
             "  python -m jarvis run --text      text REPL, no microphone needed\n"
+            "  python -m jarvis run --no-brain  echo mode; no API key needed\n"
             "  python -m jarvis say 'Good evening.'   audition the voice\n"
             "  python -m jarvis devices         list microphones and speakers\n"
             "  python -m jarvis health --json   machine-readable health report\n"
@@ -81,6 +82,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--text",
         action="store_true",
         help="run as a text REPL instead of listening (no microphone needed)",
+    )
+    run.add_argument(
+        "--no-brain",
+        action="store_true",
+        help="echo what you said instead of thinking about it; needs no API key",
     )
 
     speak = sub.add_parser("say", help="speak one phrase and exit (for auditioning a voice)")
@@ -113,7 +119,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if command == "devices":
         return _cmd_devices(console)
     if command == "run":
-        return _cmd_run(cfg, console, text_mode=args.text)
+        return _cmd_run(cfg, console, text_mode=args.text, no_brain=args.no_brain)
     if command == "say":
         return runner.say(cfg, console, " ".join(args.text))
 
@@ -325,16 +331,19 @@ def _cmd_devices(console: Console) -> int:
 # --------------------------------------------------------------------------- #
 
 
-def _cmd_run(cfg: Config, console: Console, *, text_mode: bool) -> int:
-    """Start the assistant.
+def _cmd_run(cfg: Config, console: Console, *, text_mode: bool, no_brain: bool = False) -> int:
+    """Start the assistant."""
+    brain = factory.build_echo_brain() if no_brain else None
+    if no_brain:
+        console.print()
+        console.print(
+            Text("  Echo mode: repeating what you say, not thinking about it.", style="yellow")
+        )
 
-    Milestone 2: the reply is the transcript, spoken back. Wiring the brain in
-    is a one-line change here -- the loop takes any ``Responder``.
-    """
     if text_mode:
-        return runner.run_text(cfg, console)
+        return runner.run_text(cfg, console, brain=brain)
 
-    blockers = _voice_blockers(cfg)
+    blockers = _voice_blockers(cfg, need_brain=not no_brain)
     if blockers:
         console.print()
         console.print(Text("  Not ready to listen yet.", style="bold red"))
@@ -352,15 +361,19 @@ def _cmd_run(cfg: Config, console: Console, *, text_mode: bool) -> int:
     return runner.run_voice(cfg, console)
 
 
-def _voice_blockers(cfg: Config) -> list[tuple[str, str | None]]:
+def _voice_blockers(cfg: Config, *, need_brain: bool = True) -> list[tuple[str, str | None]]:
     """Checks that must pass before listening is even worth attempting.
 
     Starting the loop and letting it explode on the first missing model would
     technically work, but the failure would arrive after a ten-second model load
     and would name a file rather than a fix.
+
+    A missing API key is deliberately *not* a blocker: JARVIS still wakes,
+    listens and transcribes, then says out loud that it cannot think. Refusing
+    to start would hide which half is broken.
     """
     report = run_health_checks(cfg)
-    required = (
+    required = [
         "audio.backend",
         "audio.input",
         "audio.output",
@@ -370,7 +383,9 @@ def _voice_blockers(cfg: Config) -> list[tuple[str, str | None]]:
         "stt.model",
         "tts.engine",
         "tts.voice",
-    )
+    ]
+    if need_brain:
+        required.append("brain.sdk")
     blockers: list[tuple[str, str | None]] = []
     for check_id in required:
         check = report.by_id(check_id)

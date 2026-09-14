@@ -1,14 +1,15 @@
 """The voice loop.
 
-    wake word -> record until silence -> transcribe -> reply -> speak
+    wake word -> record until silence -> transcribe -> think -> speak
 
-At milestone 2 the reply is the transcript itself, spoken back. That is not a
-placeholder for its own sake: echoing proves every stage of the audio pipeline
-independently of whether the brain is any good, and it is the only way to tell a
-transcription problem from a reasoning one later.
+The brain streams its reply, and the loop speaks each sentence the moment it is
+complete rather than waiting for the whole answer. Because playback queues
+rather than blocks, sentence two is being synthesised while sentence one is
+still being heard.
 
-The loop owns no audio backend of its own. It is handed the interfaces, which is
-what lets the tests drive the whole thing with synthetic audio and no hardware.
+The loop owns no audio backend and no API client of its own. It is handed the
+interfaces, which is what lets the tests drive the whole thing with synthetic
+audio, no hardware and no API key.
 """
 
 from __future__ import annotations
@@ -21,6 +22,13 @@ from jarvis.audio.recorder import PreRollBuffer, RecordingOutcome, UtteranceReco
 from jarvis.audit import AuditLog
 from jarvis.config import Config
 from jarvis.errors import JarvisError
+from jarvis.interfaces.agent import (
+    AgentFailed,
+    Brain,
+    SentenceComplete,
+    TextDelta,
+    TurnFinished,
+)
 from jarvis.interfaces.audio import AudioInput, AudioOutput, Samples
 from jarvis.interfaces.stt import Transcriber, Transcript
 from jarvis.interfaces.tts import SpeechSynthesizer
@@ -30,14 +38,6 @@ from jarvis.state import State, StateListener
 
 log = get_logger("loop")
 
-Responder = Callable[[str], str]
-"""Turns the user's words into a reply. Milestone 3 swaps the echo for the brain."""
-
-
-def echo_responder(text: str) -> str:
-    """The milestone 2 'brain': say back exactly what was heard."""
-    return text
-
 
 @dataclass(slots=True)
 class TurnResult:
@@ -46,7 +46,7 @@ class TurnResult:
     transcript: Transcript | None
     reply: str | None
     outcome: RecordingOutcome
-    heard_wake_word: bool = True
+    failed: bool = False
 
 
 class VoiceLoop:
@@ -61,10 +61,11 @@ class VoiceLoop:
         wake_word: WakeWordDetector,
         transcriber: Transcriber,
         synthesizer: SpeechSynthesizer,
+        brain: Brain,
         audit: AuditLog,
-        responder: Responder = echo_responder,
         on_state: StateListener | None = None,
         on_turn: Callable[[TurnResult], None] | None = None,
+        on_reply_delta: Callable[[str], None] | None = None,
     ) -> None:
         self._cfg = cfg
         self._audio_in = audio_in
@@ -72,10 +73,11 @@ class VoiceLoop:
         self._wake_word = wake_word
         self._transcriber = transcriber
         self._synthesizer = synthesizer
+        self._brain = brain
         self._audit = audit
-        self._responder = responder
         self._on_state = on_state
         self._on_turn = on_turn
+        self._on_reply_delta = on_reply_delta
 
         self._state = State.IDLE
         self._running = False
@@ -189,27 +191,108 @@ class VoiceLoop:
             audio_seconds=round(recording.clip.duration_seconds, 2),
         )
 
-        reply = self._responder(transcript.text)
-        self.speak(reply)
-        self._notify_turn(TurnResult(transcript, reply, recording.outcome))
+        reply, failed = self.think_and_speak(transcript.text)
+        self._notify_turn(TurnResult(transcript, reply, recording.outcome, failed=failed))
         self._return_to_idle()
+
+    # -- thinking ----------------------------------------------------------- #
+
+    def think_and_speak(self, user_text: str) -> tuple[str, bool]:
+        """Run one brain turn, speaking each sentence the moment it completes.
+
+        This is where the reply stops feeling slow. The brain yields a
+        SentenceComplete as soon as one is finished, and playback queues rather
+        than blocks, so sentence two is being synthesised while sentence one is
+        still being heard.
+
+        Returns:
+            The full reply, and whether the turn failed.
+        """
+        self._set_state(State.THINKING)
+        spoken_anything = False
+        reply = ""
+        failed = False
+        started = time.monotonic()
+        first_sentence_at: float | None = None
+
+        for event in self._brain.respond(user_text):
+            if isinstance(event, TextDelta) and self._on_reply_delta is not None:
+                self._on_reply_delta(event.text)
+
+            elif isinstance(event, SentenceComplete):
+                if first_sentence_at is None:
+                    first_sentence_at = time.monotonic() - started
+                if not spoken_anything:
+                    self._set_state(State.SPEAKING)
+                    spoken_anything = True
+                self._enqueue(event.text)
+
+            elif isinstance(event, AgentFailed):
+                failed = True
+                log.error("Brain failed: %s", event.detail)
+                self._audit.record("turn.failed", outcome="error", detail=event.detail)
+                self._set_state(State.SPEAKING)
+                self._enqueue(event.spoken)
+                reply = event.spoken
+                spoken_anything = True
+
+            elif isinstance(event, TurnFinished) and not failed:
+                reply = event.text
+                self._audit.record(
+                    "turn.replied",
+                    outcome="ok",
+                    detail=event.text,
+                    stop_reason=event.stop_reason,
+                    **event.usage,
+                )
+
+        if first_sentence_at is not None:
+            log.debug("First sentence ready after %.2fs", first_sentence_at)
+
+        if spoken_anything:
+            self._drain_playback()
+        return reply, failed
+
+    def _enqueue(self, sentence: str) -> None:
+        """Synthesise one sentence and hand it to the speaker.
+
+        Synthesis happens inline rather than on a worker thread. Piper runs
+        several times faster than real time, so by the time a sentence finishes
+        playing the next is long since ready -- and a queue of audio clips is
+        far easier to cancel cleanly than a queue of threads, which is what
+        milestone 6 needs.
+        """
+        if not sentence.strip():
+            return
+        try:
+            clip = self._synthesizer.synthesize(sentence)
+        except JarvisError as exc:
+            log.error("Could not synthesise speech: %s", exc)
+            self._audit.record("tts.failed", outcome="error", detail=str(exc))
+            return
+        self._audio_out.play(clip)
+
+    def _drain_playback(self) -> None:
+        """Wait for everything queued to finish playing.
+
+        The timeout is generous because the queue may hold several sentences by
+        now; it exists only so a dead output stream cannot park the loop.
+        """
+        self._audio_out.wait_until_done(timeout=120.0)
 
     # -- speaking ----------------------------------------------------------- #
 
     def speak(self, text: str) -> None:
-        """Synthesise and play ``text``, blocking until it has finished."""
+        """Synthesise and play a fixed phrase, blocking until it has finished.
+
+        Used for the loop's own apologies. Replies from the brain go through
+        :meth:`think_and_speak`, which starts speaking sooner.
+        """
         if not text.strip():
             return
         self._set_state(State.SPEAKING)
-        try:
-            clip = self._synthesizer.synthesize(text)
-            self._audio_out.play(clip)
-            # Wait a little beyond the clip's own length; if the stream dies we
-            # would otherwise block here forever.
-            self._audio_out.wait_until_done(timeout=clip.duration_seconds + 5.0)
-        except JarvisError as exc:
-            log.error("Could not speak: %s", exc)
-            self._audit.record("tts.failed", outcome="error", detail=str(exc))
+        self._enqueue(text)
+        self._drain_playback()
 
     def _fail(self, spoken: str, exc: Exception) -> None:
         log.error("%s (%s)", spoken, exc)

@@ -20,6 +20,7 @@ from jarvis.state import State
 from .conftest import (
     FakeAudioInput,
     FakeAudioOutput,
+    FakeBrain,
     FakeSynthesizer,
     FakeTranscriber,
     FakeWakeWord,
@@ -43,12 +44,14 @@ def wired(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         "wake_word": FakeWakeWord({0}),
         "transcriber": FakeTranscriber(["what time is it"]),
         "synthesizer": FakeSynthesizer(),
+        "brain": FakeBrain(["The time is twenty past three."]),
     }
     monkeypatch.setattr(factory, "build_audio_input", lambda cfg: parts["audio_in"])
     monkeypatch.setattr(factory, "build_audio_output", lambda cfg, sample_rate: parts["audio_out"])
     monkeypatch.setattr(factory, "build_wake_word", lambda cfg: parts["wake_word"])
     monkeypatch.setattr(factory, "build_transcriber", lambda cfg: parts["transcriber"])
     monkeypatch.setattr(factory, "build_synthesizer", lambda cfg: parts["synthesizer"])
+    monkeypatch.setattr(factory, "build_brain", lambda cfg: parts["brain"])
     return parts
 
 
@@ -77,7 +80,8 @@ class TestVoiceMode:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         assert runner.run_voice(cfg, console) == 0
-        assert wired["synthesizer"].spoken == ["what time is it"]
+        assert wired["brain"].asked == ["what time is it"]
+        assert wired["synthesizer"].spoken == ["The time is twenty past three."]
 
     def test_the_prompt_spells_the_wake_word_readably(
         self,
@@ -175,7 +179,9 @@ class TestTextMode:
     ) -> None:
         scripted_input(monkeypatch, ["hello there"])
         assert runner.run_text(cfg, console) == 0
-        assert "hello there" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert wired["brain"].asked == ["hello there"]
+        assert "The time is twenty past three." in out
 
     def test_replies_are_also_spoken(
         self,
@@ -187,7 +193,7 @@ class TestTextMode:
         """Text mode doubles as the way to audition the voice."""
         scripted_input(monkeypatch, ["good evening"])
         runner.run_text(cfg, console)
-        assert wired["synthesizer"].spoken == ["good evening"]
+        assert wired["synthesizer"].spoken == ["The time is twenty past three."]
 
     def test_quit_leaves(
         self,
@@ -198,7 +204,7 @@ class TestTextMode:
     ) -> None:
         scripted_input(monkeypatch, ["/quit", "never reached"])
         runner.run_text(cfg, console)
-        assert wired["synthesizer"].spoken == []
+        assert wired["brain"].asked == []
 
     def test_blank_lines_are_ignored(
         self,
@@ -209,18 +215,35 @@ class TestTextMode:
     ) -> None:
         scripted_input(monkeypatch, ["", "   ", "real input"])
         runner.run_text(cfg, console)
-        assert wired["synthesizer"].spoken == ["real input"]
+        assert wired["brain"].asked == ["real input"]
 
-    def test_a_custom_responder_is_used(
+    def test_an_injected_brain_is_used(
         self,
         cfg: Config,
         console: Console,
         wired: dict[str, Any],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        """This is how `run --no-brain` swaps in the echo brain."""
         scripted_input(monkeypatch, ["ping"])
-        runner.run_text(cfg, console, responder=lambda text: f"pong: {text}")
-        assert wired["synthesizer"].spoken == ["pong: ping"]
+        runner.run_text(cfg, console, brain=FakeBrain(["pong"]))
+        assert wired["synthesizer"].spoken == ["pong"]
+
+    def test_a_brain_failure_is_shown_and_spoken(
+        self,
+        cfg: Config,
+        console: Console,
+        wired: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Silence would leave the user unsure whether it heard them at all."""
+        scripted_input(monkeypatch, ["hello"])
+        runner.run_text(
+            cfg, console, brain=FakeBrain(fail_with="I can't reach the network just now.")
+        )
+        assert "can't reach the network" in capsys.readouterr().out
+        assert wired["synthesizer"].spoken == ["I can't reach the network just now."]
 
     def test_no_speaker_degrades_to_text_only(
         self,
@@ -236,9 +259,9 @@ class TestTextMode:
             raise AudioDeviceError("No speaker.", remedy="connect one")
 
         monkeypatch.setattr(factory, "build_audio_output", no_speaker)
-        scripted_input(monkeypatch, ["still works"])
+        scripted_input(monkeypatch, ["anything"])
 
-        assert runner.run_text(cfg, console) == 0
+        assert runner.run_text(cfg, console, brain=FakeBrain(["still works"])) == 0
         out = capsys.readouterr().out
         assert "text-only mode" in out
         assert "still works" in out

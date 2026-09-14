@@ -115,19 +115,49 @@ uv run python -m jarvis health --json        # machine-readable report
 uv run python -m jarvis devices              # list microphones and speakers
 uv run python -m jarvis run                  # start listening for the wake word
 uv run python -m jarvis run --text           # text REPL, no microphone needed
+uv run python -m jarvis run --no-brain       # echo mode; no API key needed
 uv run python -m jarvis say 'Good evening.'  # audition the voice
 ```
 
 ### Talking to it
 
 Run `python -m jarvis run`, say **"hey Jarvis"**, wait for `[listening]`, then
-speak. It records until you stop talking, transcribes locally, and -- as of
-milestone 2 -- says your words back to you. Echoing is deliberate: it proves
-every stage of the audio path independently of whether the reasoning is any
-good, which is the only way to tell a transcription problem from a thinking one
-once the brain is wired in.
+speak. It records until you stop talking, transcribes locally, sends the text to
+Claude, and starts speaking the reply as soon as the first sentence is ready.
 
 The first time it opens the microphone, macOS will ask for permission.
+
+### Why it starts talking before it has finished thinking
+
+The reply is streamed. As each sentence completes it is handed straight to
+speech, so JARVIS begins talking roughly when the *first* sentence lands rather
+than when the last one does. On a three-sentence answer that is the difference
+between a half-second pause and a three-second one, which is most of what makes
+an assistant feel present rather than sluggish.
+
+Sentence boundaries are found on the stream, which means not splitting after
+"Dr.", "3 p.m." or the "3." of "3.14" -- cutting a sentence in the wrong place
+is more jarring than waiting a moment longer.
+
+### Echo mode
+
+`run --no-brain` skips Claude entirely and repeats what you said. It needs no
+API key and costs nothing. Use it to check the audio path in isolation: if echo
+sounds right but real replies do not, the problem is reasoning, not microphones.
+
+### What a conversation costs
+
+Every turn is one API call. With the default `claude-sonnet-5` and the short
+replies the system prompt asks for, a typical exchange is well under a penny,
+but it is not free and there is no local fallback for the thinking step. To
+change model or spend, edit the `llm` section of `config.yaml`:
+
+- `model` -- `claude-haiku-4-5` is cheaper and faster; `claude-opus-5` is better
+  at multi-step reasoning but noticeably slower to first word.
+- `effort` -- `low` by default, because you are standing there waiting. Raise it
+  if replies feel careless.
+- `history_turns` -- how much conversation is re-sent each turn. Lower it to
+  spend less; raise it if JARVIS forgets what you just said.
 
 ### Working without a microphone
 
@@ -187,7 +217,14 @@ dataclasses defined alongside them, and are wired together only in
 `src/jarvis/cli.py`. Swapping Piper for a different synthesiser, or
 faster-whisper for a different recogniser, means writing one class.
 
-The agent is the only module that talks to Anthropic.
+The agent is the only module that talks to Anthropic. It hands the rest of the
+system a stream of events -- text deltas, completed sentences, a finished turn,
+a failure -- so the voice loop, the text REPL and (later) the status window all
+consume the same thing.
+
+A turn is a generator, which is how interruption will work in milestone 6: the
+loop stops consuming it and the HTTP stream tears itself down. There is no
+cancellation flag to get wrong.
 
 ```
 src/jarvis/
@@ -195,7 +232,7 @@ src/jarvis/
   audio/           sounddevice capture and playback
   wake/            openWakeWord detector
   stt/             faster-whisper transcriber
-  agent/           Anthropic client, streaming, tool dispatch
+  agent/           Anthropic client, streaming, the system prompt, echo brain
   tools/           one file per tool, registered by decorator
   tts/             Piper and ElevenLabs synthesisers
   memory/          SQLite store and embedding recall
@@ -241,6 +278,17 @@ mixing and cancellation code is genuinely executed rather than mocked past.
 Tests marked `hardware` run against real downloaded models and skip themselves
 when those models are absent.
 
+### When the API will not cooperate
+
+Every failure mode has its own spoken sentence, because "sorry, something went
+wrong" tells you nothing about whether to try again. A rate limit says to wait a
+moment; a missing key says so and prints the fix; a dropped connection says it
+could not reach the network. Anything already spoken and audited is logged at
+debug rather than shouted into the middle of the conversation.
+
+A failed turn is not written to the conversation history, so a dangling question
+with no answer cannot poison the next request.
+
 ### Swapping an implementation
 
 Every stage is an interface in `src/jarvis/interfaces/` with its implementation
@@ -254,8 +302,8 @@ function there. Nothing else needs to know.
 | --- | --- | --- |
 | 1 | Skeleton: repo, deps, config, logging, health check | **Done** |
 | 2 | Voice loop with no brain: wake -> record -> transcribe -> speak back | **Done** |
-| 3 | Brain: streaming Anthropic client, speak on first sentence | Next |
-| 4 | Tools: time, weather, web search, shell, files, timers, notes, OS control | |
+| 3 | Brain: streaming Anthropic client, speak on first sentence | **Done** |
+| 4 | Tools: time, weather, web search, shell, files, timers, notes, OS control | Next |
 | 5 | Memory: SQLite facts with embeddings, injected each turn | |
 | 6 | Interrupt handling: barge-in cuts TTS immediately | |
 | 7 | Polish: always-on-top status window and live transcript | |

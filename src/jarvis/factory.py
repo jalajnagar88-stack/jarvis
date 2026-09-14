@@ -11,8 +11,11 @@ pay all the loading costs up front with a progress message.
 
 from __future__ import annotations
 
+from jarvis.agent.anthropic_brain import AnthropicBrain
+from jarvis.agent.echo import EchoBrain
 from jarvis.audio.sounddevice_io import SoundDeviceInput, SoundDeviceOutput
 from jarvis.config import Config
+from jarvis.interfaces.agent import Brain
 from jarvis.interfaces.audio import AudioInput, AudioOutput
 from jarvis.interfaces.stt import Transcriber
 from jarvis.interfaces.tts import SpeechSynthesizer
@@ -49,6 +52,21 @@ def build_wake_word(cfg: Config) -> WakeWordDetector:
 
 def build_transcriber(cfg: Config) -> Transcriber:
     return FasterWhisperTranscriber(cfg.stt)
+
+
+def build_brain(cfg: Config) -> Brain:
+    """Build the reasoning engine.
+
+    Constructing this is cheap and never contacts the API: a missing key is
+    reported when the first turn runs, so JARVIS still starts, still hears you,
+    and still explains itself out loud.
+    """
+    return AnthropicBrain(cfg)
+
+
+def build_echo_brain() -> Brain:
+    """The milestone 2 brain: repeats what it heard. Needs no API key."""
+    return EchoBrain()
 
 
 def build_synthesizer(cfg: Config) -> SpeechSynthesizer:
