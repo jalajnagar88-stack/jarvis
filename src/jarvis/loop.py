@@ -18,6 +18,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from jarvis.audio.barge_in import BargeInDetector
 from jarvis.audio.recorder import PreRollBuffer, RecordingOutcome, UtteranceRecorder
 from jarvis.audit import AuditLog
 from jarvis.config import Config
@@ -42,6 +43,10 @@ from jarvis.tools.confirm import interpret_confirmation
 
 log = get_logger("loop")
 
+PLAYBACK_TIMEOUT = 120.0
+"""Ceiling on waiting for speech to finish. Only a dead output stream should
+ever reach it."""
+
 
 @dataclass(slots=True)
 class TurnResult:
@@ -51,6 +56,7 @@ class TurnResult:
     reply: str | None
     outcome: RecordingOutcome
     failed: bool = False
+    interrupted: bool = False
 
 
 class VoiceLoop:
@@ -72,6 +78,7 @@ class VoiceLoop:
         on_reply_delta: Callable[[str], None] | None = None,
         on_confirmation: Callable[[ConfirmationRequired], None] | None = None,
         on_tool: Callable[[str, bool | None], None] | None = None,
+        on_interrupt: Callable[[], None] | None = None,
     ) -> None:
         self._cfg = cfg
         self._audio_in = audio_in
@@ -86,6 +93,13 @@ class VoiceLoop:
         self._on_reply_delta = on_reply_delta
         self._on_confirmation = on_confirmation
         self._on_tool = on_tool
+        self._on_interrupt = on_interrupt
+        self._interrupted = False
+        self._barge_in = BargeInDetector(
+            config=cfg.interrupt,
+            sample_rate=cfg.audio.sample_rate,
+            block_size=cfg.audio.block_size,
+        )
 
         self._state = State.IDLE
         self._running = False
@@ -200,7 +214,21 @@ class VoiceLoop:
         )
 
         reply, failed = self.think_and_speak(transcript.text)
-        self._notify_turn(TurnResult(transcript, reply, recording.outcome, failed=failed))
+        self._notify_turn(
+            TurnResult(
+                transcript,
+                reply,
+                recording.outcome,
+                failed=failed,
+                interrupted=self._interrupted,
+            )
+        )
+
+        if self._interrupted:
+            # The user is already talking. Record them straight away instead of
+            # making them say the wake word again mid-sentence.
+            self._begin_listening()
+            return
         self._return_to_idle()
 
     # -- thinking ----------------------------------------------------------- #
@@ -223,7 +251,16 @@ class VoiceLoop:
         started = time.monotonic()
         first_sentence_at: float | None = None
 
-        for event in self._brain.respond(user_text):
+        self._interrupted = False
+        stream = self._brain.respond(user_text)
+
+        for event in stream:
+            if self._interrupted:
+                # Abandoning the iterator closes the generator, which tears down
+                # the HTTP stream. There is no cancellation flag to get wrong.
+                _close(stream)
+                break
+
             if isinstance(event, TextDelta) and self._on_reply_delta is not None:
                 self._on_reply_delta(event.text)
 
@@ -281,7 +318,7 @@ class VoiceLoop:
         if first_sentence_at is not None:
             log.debug("First sentence ready after %.2fs", first_sentence_at)
 
-        if spoken_anything:
+        if spoken_anything and not self._interrupted:
             self._drain_playback()
         return reply, failed
 
@@ -305,12 +342,47 @@ class VoiceLoop:
         self._audio_out.play(clip)
 
     def _drain_playback(self) -> None:
-        """Wait for everything queued to finish playing.
+        """Wait for queued speech to finish, watching for an interruption.
 
-        The timeout is generous because the queue may hold several sentences by
-        now; it exists only so a dead output stream cannot park the loop.
+        This is the barge-in path. Rather than blocking on the audio device, it
+        keeps reading the microphone while JARVIS talks; the moment the user
+        starts speaking, playback is cancelled and the loop goes straight to
+        listening. Because :meth:`AudioOutput.cancel` clears the queue inside
+        one PortAudio callback, that happens mid-word rather than at the end of
+        the sentence.
         """
-        self._audio_out.wait_until_done(timeout=120.0)
+        if not self._cfg.interrupt.enabled:
+            self._audio_out.wait_until_done(timeout=PLAYBACK_TIMEOUT)
+            return
+
+        self._barge_in.begin()
+        deadline = time.monotonic() + PLAYBACK_TIMEOUT
+        try:
+            for block in self._audio_in.blocks():
+                if not self._running:
+                    break
+                if not self._audio_out.is_playing:
+                    break
+                if time.monotonic() > deadline:
+                    log.warning("Playback did not finish in time; carrying on.")
+                    break
+                if self._barge_in.feed(block):
+                    self._interrupt()
+                    return
+        finally:
+            self._barge_in.end()
+
+    def _interrupt(self) -> None:
+        """Cut speech immediately and record what the user is saying."""
+        self._audio_out.cancel()
+        self._interrupted = True
+        self._audit.record("turn.interrupted", outcome="info", detail="user spoke over reply")
+        log.info("Cutting speech; listening.")
+        if self._on_interrupt is not None:
+            try:
+                self._on_interrupt()
+            except Exception as exc:
+                log.warning("Interrupt listener raised %r; continuing.", exc)
 
     # -- confirmation ------------------------------------------------------- #
 
@@ -414,3 +486,10 @@ class VoiceLoop:
                 self._on_turn(result)
             except Exception as exc:
                 log.warning("Turn listener raised %r; continuing.", exc)
+
+
+def _close(iterator: object) -> None:
+    """Close a generator if it is one. Implementations may return any iterator."""
+    close = getattr(iterator, "close", None)
+    if callable(close):
+        close()

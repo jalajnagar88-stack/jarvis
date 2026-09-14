@@ -8,6 +8,7 @@ network is mocked here.
 from __future__ import annotations
 
 import shutil
+from collections import deque
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -133,6 +134,10 @@ def stub_models(cfg: Config) -> Iterator[Config]:
 class FakeAudioInput(AudioInput):
     """Replays a scripted list of blocks, then ends the stream.
 
+    Blocks are consumed, not replayed: calling ``blocks()`` a second time
+    continues where the first left off, which is how the real queue-backed
+    input behaves and what the barge-in path depends on.
+
     ``flush()`` only counts calls. The real draining semantics belong to
     SoundDeviceInput's own queue and are tested there; here we want a script
     that survives the loop flushing between turns.
@@ -145,7 +150,7 @@ class FakeAudioInput(AudioInput):
         sample_rate: int = 16_000,
         block_size: int = 1280,
     ) -> None:
-        self._blocks = list(blocks)
+        self._blocks = deque(blocks)
         self._sample_rate = sample_rate
         self._block_size = block_size
         self.started = False
@@ -167,7 +172,8 @@ class FakeAudioInput(AudioInput):
         self.stopped = True
 
     def blocks(self) -> Iterator[Samples]:
-        yield from self._blocks
+        while self._blocks:
+            yield self._blocks.popleft()
 
     def flush(self) -> int:
         self.flush_calls += 1

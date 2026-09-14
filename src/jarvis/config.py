@@ -192,6 +192,7 @@ class InterruptConfig(_Base):
     enabled: bool = True
     threshold: float = Field(0.05, ge=0.0, le=1.0)
     min_duration_seconds: float = Field(0.25, ge=0.0)
+    grace_seconds: float = Field(0.35, ge=0.0)
 
 
 class UiConfig(_Base):

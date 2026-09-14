@@ -311,6 +311,10 @@ interrupt:
   # How long that level must hold before we treat it as a real interruption,
   # in seconds. Too low and a door slam stops playback.
   min_duration_seconds: 0.25
+  # Ignore the microphone entirely for this long after speech starts. The
+  # opening of a sentence is the loudest part of JARVIS's own output, and this
+  # is what stops it cutting itself off. Raise it if your speakers are loud.
+  grace_seconds: 0.35
 
 # -----------------------------------------------------------------------------
 # Status window (milestone 7)

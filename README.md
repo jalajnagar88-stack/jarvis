@@ -166,6 +166,24 @@ microphone. Replies are still spoken aloud, so it is also the quickest way to
 audition a voice. If no speaker is available either, it degrades to printing
 rather than failing.
 
+### Interrupting it
+
+Start talking while JARVIS is speaking and it stops mid-word and listens. You do
+not need the wake word again — it goes straight back to recording, because you
+are already talking.
+
+The hard part is that JARVIS's own voice comes out of the speakers and back into
+the microphone, so a plain level threshold would cut it off every time. Three
+things prevent that: interruption is judged against a higher threshold than
+ordinary speech, the level has to hold for `min_duration_seconds` rather than a
+single loud block, and the first `grace_seconds` of each reply are ignored
+entirely — the opening of a sentence is the loudest part of its own output.
+
+This is not echo cancellation. At a sensible speaker volume it works, and it
+fails in the safe direction: a missed interruption means waiting for the sentence
+to finish, not JARVIS talking over itself indefinitely. If it cuts itself off,
+raise `interrupt.threshold`; if it ignores you, lower it.
+
 ### Tuning the listening
 
 These live under `audio.silence` in `config.yaml`. The defaults suit a quiet
@@ -180,6 +198,8 @@ room; a noisy one usually needs the threshold raised.
 | Triggers on background noise | `wake_word.threshold` | up (try 0.6-0.7) |
 | Misses the wake word | `wake_word.threshold` | down |
 | Clips the first word of your command | `preroll_seconds` | up |
+| Cuts itself off while speaking | `interrupt.threshold` | up |
+| Ignores you when you talk over it | `interrupt.threshold` | down |
 
 ### Exit codes
 
@@ -352,8 +372,8 @@ function there. Nothing else needs to know.
 | 3 | Brain: streaming Anthropic client, speak on first sentence | **Done** |
 | 4 | Tools: time, weather, web search, shell, files, timers, notes, OS control | **Done** |
 | 5 | Memory: SQLite facts with embeddings, injected each turn | **Done** |
-| 6 | Interrupt handling: barge-in cuts TTS immediately | Next |
-| 7 | Polish: always-on-top status window and live transcript | |
+| 6 | Interrupt handling: barge-in cuts TTS immediately | **Done** |
+| 7 | Polish: always-on-top status window and live transcript | Next |
 
 ## Licence
 

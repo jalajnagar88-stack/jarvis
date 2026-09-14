@@ -83,6 +83,7 @@ def run_voice(cfg: Config, console: Console, *, brain: Brain | None = None) -> i
         on_turn=lambda turn: _print_turn(console, turn),
         on_confirmation=lambda event: _print_confirmation(console, event),
         on_tool=lambda name, ok: _print_tool(console, name, ok),
+        on_interrupt=lambda: console.print(Text("  [interrupted]", style="dim")),
     )
     # A timer that fires while JARVIS is idle should say so out loud.
     timers.announce_with(loop.speak)
