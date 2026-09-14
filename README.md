@@ -243,6 +243,18 @@ src/jarvis/
   cli.py           argument parsing and wiring
 ```
 
+## Tools
+
+JARVIS can tell the time, check the weather (Open-Meteo, no key), search the web,
+read and write files in a sandboxed workspace, run shell commands, set timers,
+take notes, open applications, and change the volume. Which of those are offered
+is decided by `tools.enabled` in `config.yaml` — remove a name and the tool never
+appears in the schema at all.
+
+Adding one is a single file under `src/jarvis/tools/builtin/`: a pydantic model
+for the arguments, a function, a decorator. The JSON schema is generated from
+the model, so it cannot drift from the code that reads it.
+
 ## Safety
 
 These are enforced in code, not in configuration, and cannot be turned off from
@@ -258,6 +270,15 @@ These are enforced in code, not in configuration, and cannot be turned off from
   operation. String matching alone would not catch a symlink pointing outward.
 - **Everything is audited.** Every tool call, confirmation, and refusal is
   appended to `logs/audit.log` as timestamped JSON.
+
+The denylist and the confirmation gate are deliberately separate. Confirmation
+protects against JARVIS doing something you did not intend; the denylist
+protects against a spoken "yes" that was a misheard word, a television in the
+background, or a sentence that happened to contain "sure". Anything that could
+destroy a machine is simply not reachable through this program.
+
+Spoken confirmation is strict in the same direction: anything that is not a
+clear yes is a no, including silence, and "yes, don't do that" is a refusal.
 
 ## Development
 
@@ -303,8 +324,8 @@ function there. Nothing else needs to know.
 | 1 | Skeleton: repo, deps, config, logging, health check | **Done** |
 | 2 | Voice loop with no brain: wake -> record -> transcribe -> speak back | **Done** |
 | 3 | Brain: streaming Anthropic client, speak on first sentence | **Done** |
-| 4 | Tools: time, weather, web search, shell, files, timers, notes, OS control | Next |
-| 5 | Memory: SQLite facts with embeddings, injected each turn | |
+| 4 | Tools: time, weather, web search, shell, files, timers, notes, OS control | **Done** |
+| 5 | Memory: SQLite facts with embeddings, injected each turn | Next |
 | 6 | Interrupt handling: barge-in cuts TTS immediately | |
 | 7 | Polish: always-on-top status window and live transcript | |
 

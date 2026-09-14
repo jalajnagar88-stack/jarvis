@@ -36,8 +36,16 @@ class FakeStopDetails:
 
 
 @dataclass
+class FakeToolUseBlock:
+    id: str
+    name: str
+    input: dict[str, Any]
+    type: str = "tool_use"
+
+
+@dataclass
 class FakeMessage:
-    content: list[FakeTextBlock] = field(default_factory=list)
+    content: list[Any] = field(default_factory=list)
     stop_reason: str | None = "end_turn"
     stop_details: FakeStopDetails | None = None
     usage: FakeUsage = field(default_factory=FakeUsage)
@@ -110,6 +118,7 @@ class FakeAnthropic:
         raise_on_call: Exception | None = None,
         raise_mid_stream: tuple[int, Exception] | None = None,
         stop_reason: str = "end_turn",
+        stop_reasons: list[str] | None = None,
         stop_details: FakeStopDetails | None = None,
         **client_kwargs: Any,
     ) -> None:
@@ -120,8 +129,27 @@ class FakeAnthropic:
         self.raise_mid_stream = raise_mid_stream
         self._replies = list(replies or [["Very good, sir."]])
         self._stop_reason = stop_reason
+        self._stop_reasons = list(stop_reasons or [])
         self._stop_details = stop_details
+        self._tool_calls: list[FakeToolUseBlock] = []
+        self._tool_forever = False
         self.messages = FakeMessages(self)
+
+    def script_tool_call(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        call_id: str = "call_1",
+        forever: bool = False,
+    ) -> None:
+        """Make the next response ask for this tool.
+
+        With ``forever``, every response asks for it again -- which is how the
+        round limit is exercised.
+        """
+        self._tool_calls.append(FakeToolUseBlock(id=call_id, name=name, input=arguments))
+        self._tool_forever = forever
 
     def next_fragments(self) -> list[str]:
         if self._replies:
@@ -130,8 +158,26 @@ class FakeAnthropic:
 
     def next_final(self, fragments: list[str]) -> FakeMessage:
         text = "".join(fragments)
+        content: list[Any] = [FakeTextBlock(text=text)] if text else []
+
+        pending = None
+        if self._tool_forever and self._tool_calls:
+            pending = self._tool_calls[0]
+        elif self._tool_calls:
+            pending = self._tool_calls.pop(0)
+
+        if pending is not None:
+            content.append(pending)
+            return FakeMessage(content=content, stop_reason="tool_use")
+
+        if self._stop_reasons:
+            return FakeMessage(
+                content=content,
+                stop_reason=self._stop_reasons.pop(0),
+                stop_details=self._stop_details,
+            )
         return FakeMessage(
-            content=[FakeTextBlock(text=text)] if text else [],
+            content=content,
             stop_reason=self._stop_reason,
             stop_details=self._stop_details,
         )

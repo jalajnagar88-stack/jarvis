@@ -21,8 +21,11 @@ from jarvis.errors import JarvisError
 from jarvis.interfaces.agent import (
     AgentFailed,
     Brain,
+    ConfirmationRequired,
     SentenceComplete,
     TextDelta,
+    ToolCallFinished,
+    ToolCallStarted,
     TurnFinished,
 )
 from jarvis.interfaces.audio import AudioOutput
@@ -31,6 +34,7 @@ from jarvis.interfaces.tts import SpeechSynthesizer
 from jarvis.logging_setup import get_logger
 from jarvis.loop import TurnResult, VoiceLoop
 from jarvis.state import State
+from jarvis.tools.confirm import is_affirmative
 
 log = get_logger("runner")
 
@@ -48,7 +52,10 @@ def run_voice(cfg: Config, console: Console, *, brain: Brain | None = None) -> i
     audit = AuditLog(cfg.logging.audit_file)
 
     try:
-        thinker = brain if brain is not None else factory.build_brain(cfg)
+        timers = factory.build_timers()
+        thinker = (
+            brain if brain is not None else factory.build_brain(cfg, audit=audit, timers=timers)
+        )
         synthesizer = factory.build_synthesizer(cfg)
         synthesizer.load()
 
@@ -74,7 +81,11 @@ def run_voice(cfg: Config, console: Console, *, brain: Brain | None = None) -> i
         audit=audit,
         on_state=lambda state: _print_state(console, state),
         on_turn=lambda turn: _print_turn(console, turn),
+        on_confirmation=lambda event: _print_confirmation(console, event),
+        on_tool=lambda name, ok: _print_tool(console, name, ok),
     )
+    # A timer that fires while JARVIS is idle should say so out loud.
+    timers.announce_with(loop.speak)
 
     _install_interrupt_handler(loop, console)
 
@@ -108,7 +119,10 @@ def run_text(cfg: Config, console: Console, *, brain: Brain | None = None) -> in
     audio_out: AudioOutput | None = None
 
     try:
-        thinker = brain if brain is not None else factory.build_brain(cfg)
+        timers = factory.build_timers()
+        thinker = (
+            brain if brain is not None else factory.build_brain(cfg, audit=audit, timers=timers)
+        )
     except JarvisError as exc:
         return _report(console, exc)
 
@@ -212,6 +226,20 @@ def _run_text_turn(
                 except JarvisError as exc:
                     console.print(Text(f"\n  (could not speak: {exc.message})", style="yellow"))
 
+        elif isinstance(event, ConfirmationRequired):
+            if wrote_text:
+                console.print()
+                wrote_text = False
+            brain.confirm(event.call_id, _ask_in_terminal(console, event))
+            console.print(Text(f"{cfg.general.name.lower()} > ", style="bold green"), end="")
+
+        elif isinstance(event, ToolCallStarted):
+            _print_tool(console, event.name, None)
+
+        elif isinstance(event, ToolCallFinished):
+            if not event.ok:
+                console.print(Text(f"  ({event.name}: {event.summary})", style="yellow"))
+
         elif isinstance(event, AgentFailed):
             if wrote_text:
                 console.print()
@@ -230,6 +258,41 @@ def _run_text_turn(
     console.print()
     if audio_out is not None:
         audio_out.wait_until_done(timeout=120.0)
+
+
+def _ask_in_terminal(console: Console, event: ConfirmationRequired) -> bool:
+    """Ask for typed confirmation.
+
+    The proposed action is shown in full first -- for run_shell that means the
+    command verbatim, never a paraphrase. The user is agreeing to that exact
+    string, not to a description of it.
+    """
+    console.print()
+    console.print(Text("  " + event.prompt, style="bold yellow"))
+    for line in event.details.splitlines():
+        console.print(Text(f"    {line}", style="dim"))
+    try:
+        answer = console.input("  [bold]yes/no[/bold] > ").strip()
+    except (EOFError, KeyboardInterrupt, OSError):
+        console.print(Text("  Taking that as a no.", style="dim"))
+        return False
+
+    approved = is_affirmative(answer)
+    console.print(Text("  Approved." if approved else "  Declined.", style="dim"))
+    return approved
+
+
+def _print_confirmation(console: Console, event: ConfirmationRequired) -> None:
+    """Show a pending action in voice mode, where the question is also spoken."""
+    console.print()
+    console.print(Text("  " + event.prompt, style="bold yellow"))
+    for line in event.details.splitlines():
+        console.print(Text(f"    {line}", style="dim"))
+
+
+def _print_tool(console: Console, name: str, ok: bool | None) -> None:
+    if ok is None:
+        console.print(Text(f"  [{name}]", style="magenta"))
 
 
 def _print_remedy(console: Console, detail: str) -> None:

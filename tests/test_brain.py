@@ -23,8 +23,11 @@ from jarvis.interfaces.agent import (
     AgentEvent,
     AgentFailed,
     Brain,
+    ConfirmationRequired,
     SentenceComplete,
     TextDelta,
+    ToolCallFinished,
+    ToolCallStarted,
     TurnFinished,
 )
 
@@ -417,3 +420,155 @@ class TestEchoBrain:
         assert len(brain.history) == 2
         brain.reset()
         assert brain.history == []
+
+
+class TestToolLoop:
+    """The brain's side of tool use: asking, gating, and feeding results back."""
+
+    @pytest.fixture
+    def dispatcher(self, keyed: Config):  # type: ignore[no-untyped-def]
+        import jarvis.tools  # noqa: F401 - registers the built-ins
+        from jarvis.audit import NullAuditLog
+        from jarvis.tools.dispatch import ToolDispatcher
+
+        keyed.tools.filesystem.workspace.mkdir(parents=True, exist_ok=True)
+        return ToolDispatcher(keyed, NullAuditLog())
+
+    def test_tool_schemas_are_sent(
+        self, keyed: Config, dispatcher: object, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake = FakeAnthropic()
+        fake_anthropic.install(monkeypatch, fake)
+        events_of(AnthropicBrain(keyed, dispatcher=dispatcher), "hello")
+
+        names = [schema["name"] for schema in fake.requests[0]["tools"]]
+        assert "get_time" in names
+        assert "web_search" in names
+
+    def test_no_tools_key_when_none_are_enabled(
+        self, keyed: Config, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake = FakeAnthropic()
+        fake_anthropic.install(monkeypatch, fake)
+        events_of(AnthropicBrain(keyed), "hello")
+        assert "tools" not in fake.requests[0]
+
+    def test_a_tool_call_is_executed_and_fed_back(
+        self, keyed: Config, dispatcher: object, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake = FakeAnthropic([[""], ["It is Monday."]])
+        fake.script_tool_call("get_time", {}, call_id="call_1")
+        fake_anthropic.install(monkeypatch, fake)
+
+        events = events_of(AnthropicBrain(keyed, dispatcher=dispatcher), "what day is it")
+
+        assert any(isinstance(e, ToolCallStarted) for e in events)
+        assert any(isinstance(e, ToolCallFinished) and e.ok for e in events)
+        # The second request carries the tool result.
+        results = fake.requests[1]["messages"][-1]["content"]
+        assert results[0]["type"] == "tool_result"
+        assert results[0]["tool_use_id"] == "call_1"
+
+    def test_a_confirmed_tool_runs(
+        self, keyed: Config, dispatcher: object, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake = FakeAnthropic([[""], ["Done."]])
+        fake.script_tool_call("write_file", {"path": "x.txt", "content": "hi"}, call_id="call_w")
+        fake_anthropic.install(monkeypatch, fake)
+
+        brain = AnthropicBrain(keyed, dispatcher=dispatcher)
+        collected = []
+        for event in brain.respond("write a file"):
+            collected.append(event)
+            if isinstance(event, ConfirmationRequired):
+                brain.confirm(event.call_id, True)
+
+        assert any(isinstance(e, ConfirmationRequired) for e in collected)
+        assert (keyed.tools.filesystem.workspace / "x.txt").read_text() == "hi"
+
+    def test_a_declined_tool_does_not_run(
+        self, keyed: Config, dispatcher: object, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake = FakeAnthropic([[""], ["Understood."]])
+        fake.script_tool_call("write_file", {"path": "x.txt", "content": "hi"}, call_id="call_w")
+        fake_anthropic.install(monkeypatch, fake)
+
+        brain = AnthropicBrain(keyed, dispatcher=dispatcher)
+        for event in brain.respond("write a file"):
+            if isinstance(event, ConfirmationRequired):
+                brain.confirm(event.call_id, False)
+
+        assert not (keyed.tools.filesystem.workspace / "x.txt").exists()
+
+    def test_never_answering_the_confirmation_counts_as_no(
+        self, keyed: Config, dispatcher: object, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The safe default when a decision is somehow never collected."""
+        fake = FakeAnthropic([[""], ["Understood."]])
+        fake.script_tool_call("write_file", {"path": "x.txt", "content": "hi"}, call_id="call_w")
+        fake_anthropic.install(monkeypatch, fake)
+
+        events_of(AnthropicBrain(keyed, dispatcher=dispatcher), "write a file")
+        assert not (keyed.tools.filesystem.workspace / "x.txt").exists()
+
+    def test_the_confirmation_prompt_quotes_the_command(
+        self, keyed: Config, dispatcher: object, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake = FakeAnthropic([[""], ["Done."]])
+        fake.script_tool_call("run_shell", {"command": "git push --force"}, call_id="call_s")
+        fake_anthropic.install(monkeypatch, fake)
+
+        events = events_of(AnthropicBrain(keyed, dispatcher=dispatcher), "push")
+        prompt = next(e for e in events if isinstance(e, ConfirmationRequired)).prompt
+        assert "git push --force" in prompt
+
+    def test_the_tool_round_limit_is_enforced(
+        self, keyed: Config, dispatcher: object, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A confused model must not loop up a bill while the user waits."""
+        keyed.tools.max_iterations = 3
+        fake = FakeAnthropic([[""]] * 10)
+        fake.script_tool_call("get_time", {}, call_id="call_x", forever=True)
+        fake_anthropic.install(monkeypatch, fake)
+
+        events = events_of(AnthropicBrain(keyed, dispatcher=dispatcher), "loop")
+        assert isinstance(events[-1], AgentFailed)
+        assert "circles" in events[-1].spoken
+        assert len(fake.requests) == 3
+
+    def test_a_paused_turn_is_resumed(
+        self, keyed: Config, dispatcher: object, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A server tool pausing must not silently truncate the answer."""
+        fake = FakeAnthropic(
+            [["Searching"], [" and done."]], stop_reasons=["pause_turn", "end_turn"]
+        )
+        fake_anthropic.install(monkeypatch, fake)
+
+        events = events_of(AnthropicBrain(keyed, dispatcher=dispatcher), "search")
+        assert len(fake.requests) == 2
+        assert isinstance(events[-1], TurnFinished)
+
+    def test_history_trimming_never_starts_on_tool_results(
+        self, keyed: Config, dispatcher: object, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Results for a tool_use block the model cannot see are rejected."""
+        brain = AnthropicBrain(keyed, dispatcher=dispatcher)
+        keyed.llm.history_turns = 1
+        brain._messages = [
+            {"role": "user", "content": "one"},
+            {"role": "assistant", "content": "first"},
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "x", "content": "y"}],
+            },
+            {"role": "assistant", "content": "second"},
+        ]
+        trimmed = brain._trimmed_history()
+        assert trimmed == [] or trimmed[0]["role"] == "user"
+        assert not any(
+            isinstance(m.get("content"), list)
+            and m["content"]
+            and m["content"][0].get("type") == "tool_result"
+            for m in trimmed[:1]
+        )

@@ -25,8 +25,11 @@ from jarvis.errors import JarvisError
 from jarvis.interfaces.agent import (
     AgentFailed,
     Brain,
+    ConfirmationRequired,
     SentenceComplete,
     TextDelta,
+    ToolCallFinished,
+    ToolCallStarted,
     TurnFinished,
 )
 from jarvis.interfaces.audio import AudioInput, AudioOutput, Samples
@@ -35,6 +38,7 @@ from jarvis.interfaces.tts import SpeechSynthesizer
 from jarvis.interfaces.wake_word import WakeWordDetector
 from jarvis.logging_setup import get_logger
 from jarvis.state import State, StateListener
+from jarvis.tools.confirm import interpret_confirmation
 
 log = get_logger("loop")
 
@@ -66,6 +70,8 @@ class VoiceLoop:
         on_state: StateListener | None = None,
         on_turn: Callable[[TurnResult], None] | None = None,
         on_reply_delta: Callable[[str], None] | None = None,
+        on_confirmation: Callable[[ConfirmationRequired], None] | None = None,
+        on_tool: Callable[[str, bool | None], None] | None = None,
     ) -> None:
         self._cfg = cfg
         self._audio_in = audio_in
@@ -78,6 +84,8 @@ class VoiceLoop:
         self._on_state = on_state
         self._on_turn = on_turn
         self._on_reply_delta = on_reply_delta
+        self._on_confirmation = on_confirmation
+        self._on_tool = on_tool
 
         self._state = State.IDLE
         self._running = False
@@ -227,6 +235,30 @@ class VoiceLoop:
                     spoken_anything = True
                 self._enqueue(event.text)
 
+            elif isinstance(event, ConfirmationRequired):
+                # Drain anything already queued so the question is not spoken
+                # over the tail of the previous sentence.
+                self._drain_playback()
+                approved = self._ask_for_confirmation(event)
+                self._brain.confirm(event.call_id, approved)
+                self._set_state(State.THINKING)
+
+            elif isinstance(event, ToolCallStarted):
+                log.info("Tool: %s", event.name)
+                if self._on_tool is not None:
+                    self._on_tool(event.name, None)
+
+            elif isinstance(event, ToolCallFinished):
+                log.debug("Tool %s finished: %s", event.name, event.summary)
+                self._audit.record(
+                    "tool.call",
+                    outcome="ok" if event.ok else "error",
+                    detail=event.name,
+                    summary=event.summary,
+                )
+                if self._on_tool is not None:
+                    self._on_tool(event.name, event.ok)
+
             elif isinstance(event, AgentFailed):
                 failed = True
                 log.error("Brain failed: %s", event.detail)
@@ -279,6 +311,71 @@ class VoiceLoop:
         now; it exists only so a dead output stream cannot park the loop.
         """
         self._audio_out.wait_until_done(timeout=120.0)
+
+    # -- confirmation ------------------------------------------------------- #
+
+    def _ask_for_confirmation(self, event: ConfirmationRequired) -> bool:
+        """Put a pending tool call to the user and wait for an answer.
+
+        Speaks the question, then records and transcribes the reply through the
+        same path as any other utterance. Anything that is not a clear yes is a
+        refusal, and so is silence: the user walking away must not be read as
+        consent.
+        """
+        self._audit.record(
+            "tool.confirmation_asked", outcome="info", detail=event.name, prompt=event.prompt
+        )
+        log.info("Confirmation needed: %s", event.prompt)
+        if self._on_confirmation is not None:
+            self._on_confirmation(event)
+
+        for attempt in range(2):
+            self.speak(event.prompt if attempt == 0 else "Sorry -- yes or no?")
+            answer = self._listen_for_answer()
+            if answer is None:
+                continue
+            decision = interpret_confirmation(answer)
+            if decision is not None:
+                log.info("The user said %r -> %s", answer, "yes" if decision else "no")
+                self._audit.record(
+                    "tool.confirmation_answered",
+                    outcome="confirmed" if decision else "declined",
+                    detail=event.name,
+                    heard=answer,
+                )
+                return decision
+
+        self._audit.record(
+            "tool.confirmation_answered",
+            outcome="declined",
+            detail=event.name,
+            heard="(no clear answer)",
+        )
+        self.speak("I'll take that as a no.")
+        return False
+
+    def _listen_for_answer(self) -> str | None:
+        """Record and transcribe one short reply."""
+        self._audio_in.flush()
+        self._set_state(State.LISTENING)
+        recorder = UtteranceRecorder(
+            sample_rate=self._cfg.audio.sample_rate, silence=self._cfg.audio.silence
+        )
+        for block in self._audio_in.blocks():
+            if not self._running:
+                return None
+            if recorder.feed(block) is not RecordingOutcome.RECORDING:
+                break
+
+        recording = recorder.result()
+        if not recording.usable:
+            return None
+        try:
+            transcript = self._transcriber.transcribe(recording.clip)
+        except JarvisError as exc:
+            log.error("Could not transcribe the confirmation: %s", exc)
+            return None
+        return None if transcript.is_empty else transcript.text
 
     # -- speaking ----------------------------------------------------------- #
 

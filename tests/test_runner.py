@@ -51,7 +51,7 @@ def wired(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     monkeypatch.setattr(factory, "build_wake_word", lambda cfg: parts["wake_word"])
     monkeypatch.setattr(factory, "build_transcriber", lambda cfg: parts["transcriber"])
     monkeypatch.setattr(factory, "build_synthesizer", lambda cfg: parts["synthesizer"])
-    monkeypatch.setattr(factory, "build_brain", lambda cfg: parts["brain"])
+    monkeypatch.setattr(factory, "build_brain", lambda cfg, **kw: parts["brain"])
     return parts
 
 

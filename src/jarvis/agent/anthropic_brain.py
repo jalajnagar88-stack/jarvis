@@ -14,7 +14,7 @@ the HTTP stream. There is no cancellation flag to get wrong.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 from typing import Any
 
 from jarvis.agent.prompt import build_system_prompt
@@ -23,8 +23,11 @@ from jarvis.interfaces.agent import (
     AgentEvent,
     AgentFailed,
     Brain,
+    ConfirmationRequired,
     SentenceComplete,
     TextDelta,
+    ToolCallFinished,
+    ToolCallStarted,
     TurnFinished,
 )
 from jarvis.logging_setup import get_logger
@@ -36,10 +39,18 @@ log = get_logger("agent")
 class AnthropicBrain(Brain):
     """Turns user text into a stream of events, backed by the Anthropic API."""
 
-    def __init__(self, cfg: Config, *, fact_provider: Any = None) -> None:
+    def __init__(
+        self,
+        cfg: Config,
+        *,
+        dispatcher: Any = None,
+        fact_provider: Any = None,
+    ) -> None:
         self._cfg = cfg
         self._client: Any = None
         self._messages: list[dict[str, Any]] = []
+        self._dispatcher = dispatcher
+        self._decisions: dict[str, bool] = {}
         # Populated in milestone 5; the prompt builder already accepts facts.
         self._fact_provider = fact_provider
 
@@ -52,11 +63,16 @@ class AnthropicBrain(Brain):
     def reset(self) -> None:
         """Drop the working conversation. Stored memory is unaffected."""
         self._messages.clear()
+        self._decisions.clear()
         log.debug("Conversation history cleared.")
 
     def confirm(self, call_id: str, approved: bool) -> None:
-        """No tool needs confirmation yet; milestone 4 fills this in."""
-        raise NotImplementedError("Tool confirmation arrives in milestone 4.")
+        """Answer a :class:`ConfirmationRequired` raised during :meth:`respond`.
+
+        Call this before resuming the event iterator. A decision that never
+        arrives counts as a refusal, which is the safe default.
+        """
+        self._decisions[call_id] = approved
 
     def _ensure_client(self) -> Any:
         if self._client is not None:
@@ -106,50 +122,171 @@ class AnthropicBrain(Brain):
             yield self._failure(exc)
             return
 
-        request = self._build_request(text)
-        if self._cfg.llm.streaming:
-            yield from self._stream_turn(client, request, text)
-        else:
-            yield from self._single_turn(client, request, text)
+        yield from self._run_turn(client, text)
 
-    def _build_request(self, user_text: str) -> dict[str, Any]:
-        """Assemble the request body for one turn."""
+    def _build_request(self, messages: list[dict[str, Any]], user_text: str) -> dict[str, Any]:
+        """Assemble the request body for one leg of a turn."""
         facts = self._fact_provider(user_text) if self._fact_provider is not None else None
 
         request: dict[str, Any] = {
             "model": self._cfg.llm.model,
             "max_tokens": self._cfg.llm.max_tokens,
             "system": build_system_prompt(self._cfg, facts=facts),
-            "messages": [*self._trimmed_history(), {"role": "user", "content": user_text}],
+            "messages": messages,
             "output_config": {"effort": self._cfg.llm.effort},
         }
         # Sonnet 5 accepts adaptive or disabled; budget_tokens was removed.
         request["thinking"] = {"type": self._cfg.llm.thinking}
+
+        if self._dispatcher is not None:
+            schemas = self._dispatcher.schemas()
+            if schemas:
+                request["tools"] = schemas
         return request
 
     def _trimmed_history(self) -> list[dict[str, Any]]:
         """The recent conversation, bounded by ``llm.history_turns``.
 
         A turn is one exchange, so the message limit is twice that. Trimming
-        starts at a user message: beginning the history with an assistant reply
-        would leave it dangling from a question the model can no longer see.
+        starts at a user message whose content is not a tool result: beginning
+        the history with an assistant reply, or with results for a tool call the
+        model can no longer see, leaves it dangling.
         """
         limit = self._cfg.llm.history_turns * 2
         if limit <= 0 or len(self._messages) <= limit:
             return list(self._messages)
 
         trimmed = self._messages[-limit:]
-        while trimmed and trimmed[0].get("role") != "user":
+        while trimmed and not _is_plain_user_message(trimmed[0]):
             trimmed.pop(0)
         return trimmed
 
-    def _stream_turn(
-        self, client: Any, request: dict[str, Any], user_text: str
-    ) -> Iterator[AgentEvent]:
-        """Stream one reply, emitting each sentence as it completes."""
+    def _run_turn(self, client: Any, user_text: str) -> Iterator[AgentEvent]:
+        """One user turn, including any tool calls it needs.
+
+        Loops until the model stops asking for tools or the configured ceiling
+        is reached. The ceiling exists so a confused model cannot run up a bill
+        while the user stands there listening to silence.
+        """
+        messages: list[dict[str, Any]] = [
+            *self._trimmed_history(),
+            {"role": "user", "content": user_text},
+        ]
         splitter = SentenceSplitter()
         collected: list[str] = []
+        max_rounds = self._cfg.tools.max_iterations if self._dispatcher is not None else 1
 
+        for round_index in range(max_rounds):
+            request = self._build_request(messages, user_text)
+
+            try:
+                if self._cfg.llm.streaming:
+                    final = yield from self._stream_leg(client, request, splitter, collected)
+                else:
+                    final = yield from self._single_leg(client, request, splitter, collected)
+            except _LegFailed as failure:
+                yield failure.event
+                return
+
+            stop_reason = getattr(final, "stop_reason", None)
+
+            refusal = self._refusal_event(final, stop_reason)
+            if refusal is not None:
+                yield refusal
+                return
+
+            if stop_reason == "pause_turn":
+                # A server-side tool ran long and the turn was paused. Resending
+                # the paused assistant turn continues it; dropping it here would
+                # silently truncate the answer with no error.
+                messages.append({"role": "assistant", "content": final.content})
+                continue
+
+            tool_calls = [
+                block
+                for block in (getattr(final, "content", None) or [])
+                if getattr(block, "type", None) == "tool_use"
+            ]
+            if stop_reason != "tool_use" or not tool_calls or self._dispatcher is None:
+                break
+
+            messages.append({"role": "assistant", "content": final.content})
+            results = yield from self._run_tools(tool_calls)
+            messages.append({"role": "user", "content": results})
+
+            if round_index == max_rounds - 1:
+                log.warning("Hit the %d-round tool limit; answering with what we have.", max_rounds)
+                yield AgentFailed(
+                    spoken="I got stuck going round in circles on that one.",
+                    detail=f"reached tools.max_iterations ({max_rounds})",
+                )
+                return
+        else:  # pragma: no cover - the loop always breaks or returns
+            return
+
+        remainder = splitter.flush()
+        if remainder:
+            yield SentenceComplete(text=remainder)
+
+        reply = "".join(collected).strip()
+        self._remember_exchange(user_text, reply)
+        yield TurnFinished(
+            text=reply, stop_reason=getattr(final, "stop_reason", None), usage=_usage_of(final)
+        )
+
+    def _run_tools(
+        self, tool_calls: list[Any]
+    ) -> Generator[AgentEvent, None, list[dict[str, Any]]]:
+        """Execute a batch of tool calls, asking the user where required.
+
+        Every result is returned, including failures: dropping one leaves the
+        model with a tool_use block that has no answer, which the API rejects.
+        """
+        assert self._dispatcher is not None
+        results: list[dict[str, Any]] = []
+
+        for call in tool_calls:
+            name = getattr(call, "name", "")
+            call_id = getattr(call, "id", "")
+            raw_args = dict(getattr(call, "input", None) or {})
+
+            yield ToolCallStarted(name=name, arguments=raw_args, call_id=call_id)
+
+            approved: bool | None = None
+            if self._dispatcher.needs_confirmation(name):
+                yield ConfirmationRequired(
+                    name=name,
+                    call_id=call_id,
+                    prompt=self._dispatcher.describe(name, raw_args),
+                    details=_render_arguments(raw_args),
+                )
+                # The caller answers by calling confirm() before resuming us.
+                approved = self._decisions.pop(call_id, None)
+
+            outcome = self._dispatcher.execute(name, raw_args, approved=approved)
+            yield ToolCallFinished(
+                name=name, call_id=call_id, ok=not outcome.is_error, summary=outcome.summary
+            )
+
+            results.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": call_id,
+                    "content": outcome.content,
+                    **({"is_error": True} if outcome.is_error else {}),
+                }
+            )
+
+        return results
+
+    def _stream_leg(
+        self,
+        client: Any,
+        request: dict[str, Any],
+        splitter: SentenceSplitter,
+        collected: list[str],
+    ) -> Generator[AgentEvent, None, Any]:
+        """Stream one request, emitting sentences as they complete."""
         try:
             with client.messages.stream(**request) as stream:
                 for fragment in stream.text_stream:
@@ -159,66 +296,40 @@ class AnthropicBrain(Brain):
                     yield TextDelta(text=fragment)
                     for sentence in splitter.feed(fragment):
                         yield SentenceComplete(text=sentence)
-
-                final = stream.get_final_message()
+                return stream.get_final_message()
         except GeneratorExit:
             # The caller stopped consuming: an interruption, not an error. The
-            # `with` block above has already closed the HTTP stream.
+            # `with` block has already closed the HTTP stream.
             log.debug("Turn abandoned by the caller.")
             raise
         except Exception as exc:
-            yield self._failure(exc)
-            return
+            raise _LegFailed(self._failure(exc)) from exc
 
-        remainder = splitter.flush()
-        if remainder:
-            yield SentenceComplete(text=remainder)
-
-        reply = "".join(collected).strip()
-        stop_reason = getattr(final, "stop_reason", None)
-
-        refusal = self._refusal_event(final, stop_reason)
-        if refusal is not None:
-            yield refusal
-            return
-
-        self._remember_exchange(user_text, reply)
-        yield TurnFinished(text=reply, stop_reason=stop_reason, usage=_usage_of(final))
-
-    def _single_turn(
-        self, client: Any, request: dict[str, Any], user_text: str
-    ) -> Iterator[AgentEvent]:
+    def _single_leg(
+        self,
+        client: Any,
+        request: dict[str, Any],
+        splitter: SentenceSplitter,
+        collected: list[str],
+    ) -> Generator[AgentEvent, None, Any]:
         """Non-streaming path, for ``llm.streaming: false``.
 
-        Kept because the setting exists and a setting that silently does nothing
-        is worse than no setting. Speech cannot begin until the whole reply has
-        arrived, which is exactly the latency streaming avoids.
+        Kept because the setting exists, and a setting that silently does
+        nothing is worse than no setting. Speech cannot begin until the whole
+        reply has arrived, which is exactly the latency streaming avoids.
         """
         try:
             final = client.messages.create(**request)
         except Exception as exc:
-            yield self._failure(exc)
-            return
+            raise _LegFailed(self._failure(exc)) from exc
 
-        reply = _text_of(final)
-        stop_reason = getattr(final, "stop_reason", None)
-
-        refusal = self._refusal_event(final, stop_reason)
-        if refusal is not None:
-            yield refusal
-            return
-
-        if reply:
-            yield TextDelta(text=reply)
-            splitter = SentenceSplitter()
-            for sentence in splitter.feed(reply):
+        text = _text_of(final)
+        if text:
+            collected.append(text)
+            yield TextDelta(text=text)
+            for sentence in splitter.feed(text):
                 yield SentenceComplete(text=sentence)
-            remainder = splitter.flush()
-            if remainder:
-                yield SentenceComplete(text=remainder)
-
-        self._remember_exchange(user_text, reply)
-        yield TurnFinished(text=reply, stop_reason=stop_reason, usage=_usage_of(final))
+        return final
 
     def _refusal_event(self, final: Any, stop_reason: str | None) -> AgentFailed | None:
         """Turn a safety refusal into something speakable.
@@ -339,3 +450,34 @@ def _usage_of(message: Any) -> dict[str, int]:
         )
         if isinstance(value := getattr(usage, field, None), int)
     }
+
+
+class _LegFailed(Exception):
+    """Internal: carries an AgentFailed out of a nested generator."""
+
+    def __init__(self, event: AgentFailed) -> None:
+        super().__init__(event.detail)
+        self.event = event
+
+
+def _is_plain_user_message(message: dict[str, Any]) -> bool:
+    """True for a user message that is text, not a batch of tool results."""
+    if message.get("role") != "user":
+        return False
+    content = message.get("content")
+    if isinstance(content, str):
+        return True
+    return not any(
+        isinstance(block, dict) and block.get("type") == "tool_result" for block in content or []
+    )
+
+
+def _render_arguments(raw: dict[str, Any]) -> str:
+    """Arguments as a readable block, for the confirmation prompt on screen."""
+    lines = []
+    for key, value in raw.items():
+        text = str(value)
+        if len(text) > 300:
+            text = text[:300] + f"… ({len(text)} characters)"
+        lines.append(f"{key}: {text}")
+    return "\n".join(lines)

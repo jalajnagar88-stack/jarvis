@@ -11,6 +11,8 @@ pay all the loading costs up front with a progress message.
 
 from __future__ import annotations
 
+from typing import Any
+
 from jarvis.agent.anthropic_brain import AnthropicBrain
 from jarvis.agent.echo import EchoBrain
 from jarvis.audio.sounddevice_io import SoundDeviceInput, SoundDeviceOutput
@@ -54,14 +56,37 @@ def build_transcriber(cfg: Config) -> Transcriber:
     return FasterWhisperTranscriber(cfg.stt)
 
 
-def build_brain(cfg: Config) -> Brain:
-    """Build the reasoning engine.
+def build_brain(
+    cfg: Config,
+    *,
+    audit: Any = None,
+    memory: Any = None,
+    timers: Any = None,
+) -> Brain:
+    """Build the reasoning engine, with its tools.
 
     Constructing this is cheap and never contacts the API: a missing key is
     reported when the first turn runs, so JARVIS still starts, still hears you,
     and still explains itself out loud.
     """
-    return AnthropicBrain(cfg)
+    import jarvis.tools  # noqa: F401 - importing registers the built-in tools
+    from jarvis.audit import AuditLog
+    from jarvis.tools.dispatch import ToolDispatcher
+
+    dispatcher = ToolDispatcher(
+        cfg,
+        audit if audit is not None else AuditLog(cfg.logging.audit_file),
+        memory=memory,
+        timers=timers,
+    )
+    return AnthropicBrain(cfg, dispatcher=dispatcher)
+
+
+def build_timers(announce: Any = None) -> Any:
+    """Background timer service for the set_timer tool."""
+    from jarvis.tools.builtin.clock import TimerService
+
+    return TimerService(announce)
 
 
 def build_echo_brain() -> Brain:
