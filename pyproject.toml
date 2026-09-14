@@ -64,6 +64,8 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/jarvis"]
+# Ship the marker so the type hints are visible to anything importing jarvis.
+artifacts = ["src/jarvis/py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

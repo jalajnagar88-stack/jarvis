@@ -160,18 +160,36 @@ class TestDevicesCommand:
 
 
 class TestRunCommand:
-    def test_reports_honestly_that_it_is_not_built_yet(
+    def test_refuses_to_listen_when_models_are_missing(
         self, config_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """Better an honest 'not yet' than a half-wired loop that fails obscurely."""
-        assert main(["--config", str(config_path), "run"]) == 0
-        assert "not built yet" in capsys.readouterr().out
+        """Naming the blockers up front beats a ten-second model load then a crash."""
+        assert main(["--config", str(config_path), "run"]) == 1
+        out = capsys.readouterr().out
+        assert "Not ready to listen yet" in out
+        assert "Traceback" not in out
 
-    def test_text_mode_names_itself(
+    def test_refusal_points_at_text_mode(
         self, config_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        main(["--config", str(config_path), "run", "--text"])
-        assert "text REPL" in capsys.readouterr().out
+        main(["--config", str(config_path), "run"])
+        assert "--text" in capsys.readouterr().out
+
+    def test_text_mode_survives_a_closed_stdin(
+        self, config_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Piped from /dev/null or run under a scheduler: leave quietly."""
+        assert main(["--config", str(config_path), "run", "--text"]) == 0
+        out = capsys.readouterr().out
+        assert "Traceback" not in out
+        assert "Goodbye" in out
+
+    def test_text_mode_degrades_when_there_is_no_voice(
+        self, config_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """No Piper voice downloaded is a downgrade to text-only, not a failure."""
+        assert main(["--config", str(config_path), "run", "--text"]) == 0
+        assert "text-only mode" in capsys.readouterr().out
 
 
 class TestGracefulDegradation:

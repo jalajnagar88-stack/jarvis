@@ -47,6 +47,8 @@ class SilenceConfig(_Base):
     duration_seconds: float = Field(0.8, gt=0.0)
     max_utterance_seconds: float = Field(20.0, gt=0.0)
     min_utterance_seconds: float = Field(0.4, ge=0.0)
+    no_speech_timeout_seconds: float = Field(3.0, gt=0.0)
+    preroll_seconds: float = Field(0.25, ge=0.0)
 
 
 class AudioConfig(_Base):

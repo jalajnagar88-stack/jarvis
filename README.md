@@ -92,28 +92,64 @@ just by keyword rather than by meaning.
 `./scripts/download_models.sh` fetches all of them. To fetch one at a time:
 
 ```bash
-./scripts/download_models.sh wakeword     # openWakeWord, ~15 MB
+./scripts/download_models.sh wakeword     # openWakeWord, ~10 MB
 ./scripts/download_models.sh whisper      # faster-whisper base.en, ~140 MB
 ./scripts/download_models.sh piper        # en_GB-alan-medium voice, ~60 MB
 ./scripts/download_models.sh embeddings   # all-MiniLM-L6-v2, ~90 MB (needs --extra memory)
 ```
 
-Everything lands under `models/`, which is gitignored. To use a different Piper
-voice, browse [rhasspy/piper-voices](https://huggingface.co/rhasspy/piper-voices),
-set `tts.piper.voice` in `config.yaml`, and re-run the script.
+Everything lands under `models/`, which is gitignored. The script reads
+`config.yaml` to decide *which* wake word, Whisper size, and voice to fetch, so
+the two can never disagree: change the config, re-run the script.
+
+To use a different Piper voice, browse
+[rhasspy/piper-voices](https://huggingface.co/rhasspy/piper-voices), set
+`tts.piper.voice` in `config.yaml`, and re-run. Re-running is always safe --
+anything already downloaded is left alone.
 
 ## Usage
 
 ```bash
-uv run python -m jarvis                  # health check (the default)
-uv run python -m jarvis health --json    # machine-readable report
-uv run python -m jarvis devices          # list microphones and speakers
-uv run python -m jarvis run              # start listening
-uv run python -m jarvis run --text       # text REPL, no microphone needed
+uv run python -m jarvis                      # health check (the default)
+uv run python -m jarvis health --json        # machine-readable report
+uv run python -m jarvis devices              # list microphones and speakers
+uv run python -m jarvis run                  # start listening for the wake word
+uv run python -m jarvis run --text           # text REPL, no microphone needed
+uv run python -m jarvis say 'Good evening.'  # audition the voice
 ```
 
-The `--text` REPL exists so you can develop and test the brain, the tools, and
-memory without talking to your laptop.
+### Talking to it
+
+Run `python -m jarvis run`, say **"hey Jarvis"**, wait for `[listening]`, then
+speak. It records until you stop talking, transcribes locally, and -- as of
+milestone 2 -- says your words back to you. Echoing is deliberate: it proves
+every stage of the audio path independently of whether the reasoning is any
+good, which is the only way to tell a transcription problem from a thinking one
+once the brain is wired in.
+
+The first time it opens the microphone, macOS will ask for permission.
+
+### Working without a microphone
+
+`run --text` gives you the same pipeline with the keyboard standing in for the
+microphone. Replies are still spoken aloud, so it is also the quickest way to
+audition a voice. If no speaker is available either, it degrades to printing
+rather than failing.
+
+### Tuning the listening
+
+These live under `audio.silence` in `config.yaml`. The defaults suit a quiet
+room; a noisy one usually needs the threshold raised.
+
+| Symptom | Setting | Direction |
+| --- | --- | --- |
+| Cuts you off mid-sentence | `duration_seconds` | up |
+| Waits too long after you finish | `duration_seconds` | down |
+| Records constantly in a noisy room | `threshold` | up |
+| Misses quiet speech | `threshold` | down |
+| Triggers on background noise | `wake_word.threshold` | up (try 0.6-0.7) |
+| Misses the wake word | `wake_word.threshold` | down |
+| Clips the first word of your command | `preroll_seconds` | up |
 
 ### Exit codes
 
@@ -191,20 +227,34 @@ These are enforced in code, not in configuration, and cannot be turned off from
 ```bash
 uv run pytest                      # full suite; mocks the API and audio devices
 uv run pytest -m "not hardware"    # explicitly skip anything needing real hardware
+uv run pytest --cov                # with coverage
 uv run ruff check src tests
-uv run mypy src
+uv run ruff format src tests
+uv run mypy src tests
 ```
 
-The test suite mocks the Anthropic client and the audio devices, so it runs in
-CI with no microphone, no speakers, no downloaded models, and no API key.
+The suite runs with no microphone, no speakers, no downloaded models, and no API
+key. That is enforced rather than hoped for: PortAudio is replaced with a fake
+module whose audio callbacks the tests drive by hand, so the real queueing,
+mixing and cancellation code is genuinely executed rather than mocked past.
+
+Tests marked `hardware` run against real downloaded models and skip themselves
+when those models are absent.
+
+### Swapping an implementation
+
+Every stage is an interface in `src/jarvis/interfaces/` with its implementation
+chosen in `src/jarvis/factory.py`. To replace one -- a different recogniser, a
+different voice engine -- write a class against the interface and change one
+function there. Nothing else needs to know.
 
 ## Milestones
 
 | # | Milestone | Status |
 | --- | --- | --- |
 | 1 | Skeleton: repo, deps, config, logging, health check | **Done** |
-| 2 | Voice loop with no brain: wake -> record -> transcribe -> speak back | Next |
-| 3 | Brain: streaming Anthropic client, speak on first sentence | |
+| 2 | Voice loop with no brain: wake -> record -> transcribe -> speak back | **Done** |
+| 3 | Brain: streaming Anthropic client, speak on first sentence | Next |
 | 4 | Tools: time, weather, web search, shell, files, timers, notes, OS control | |
 | 5 | Memory: SQLite facts with embeddings, injected each turn | |
 | 6 | Interrupt handling: barge-in cuts TTS immediately | |

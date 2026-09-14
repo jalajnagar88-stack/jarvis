@@ -58,8 +58,16 @@ audio:
     # Hard ceiling on a single utterance, in seconds. Prevents a stuck mic from
     # recording forever.
     max_utterance_seconds: 20.0
-    # Minimum recording length. Guards against a cough triggering a transcript.
+    # Minimum amount of actual *speech* (not elapsed time) needed before a
+    # recording counts. Guards against a cough triggering a transcript.
     min_utterance_seconds: 0.4
+    # If the wake word fires but nothing is said, give up after this many
+    # seconds rather than making you wait out max_utterance_seconds.
+    no_speech_timeout_seconds: 3.0
+    # Audio kept from just *before* the wake word fired. The wake word is
+    # detected at the end of "hey Jarvis", by which point a quick speaker is
+    # already into the command; this recovers that first syllable.
+    preroll_seconds: 0.25
 
 # -----------------------------------------------------------------------------
 # Wake word (openWakeWord — fully offline, no API key)

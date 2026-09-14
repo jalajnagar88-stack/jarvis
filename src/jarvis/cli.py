@@ -19,7 +19,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
-from jarvis import __version__
+from jarvis import __version__, runner
 from jarvis.audit import AuditLog
 from jarvis.config import Config
 from jarvis.errors import JarvisError
@@ -49,6 +49,9 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "Examples:\n"
             "  python -m jarvis                 run the health check\n"
+            "  python -m jarvis run             start listening for the wake word\n"
+            "  python -m jarvis run --text      text REPL, no microphone needed\n"
+            "  python -m jarvis say 'Good evening.'   audition the voice\n"
             "  python -m jarvis devices         list microphones and speakers\n"
             "  python -m jarvis health --json   machine-readable health report\n"
         ),
@@ -79,6 +82,9 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="run as a text REPL instead of listening (no microphone needed)",
     )
+
+    speak = sub.add_parser("say", help="speak one phrase and exit (for auditioning a voice)")
+    speak.add_argument("text", nargs="+", help="what to say")
     return parser
 
 
@@ -108,6 +114,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _cmd_devices(console)
     if command == "run":
         return _cmd_run(cfg, console, text_mode=args.text)
+    if command == "say":
+        return runner.say(cfg, console, " ".join(args.text))
 
     parser.error(f"unknown command {command!r}")
 
@@ -320,27 +328,55 @@ def _cmd_devices(console: Console) -> int:
 def _cmd_run(cfg: Config, console: Console, *, text_mode: bool) -> int:
     """Start the assistant.
 
-    Not yet implemented: the voice loop lands in milestone 2 and the brain in
-    milestone 3. Rather than start something half-wired, report exactly what is
-    missing and point at the health check.
+    Milestone 2: the reply is the transcript, spoken back. Wiring the brain in
+    is a one-line change here -- the loop takes any ``Responder``.
+    """
+    if text_mode:
+        return runner.run_text(cfg, console)
+
+    blockers = _voice_blockers(cfg)
+    if blockers:
+        console.print()
+        console.print(Text("  Not ready to listen yet.", style="bold red"))
+        for detail, remedy in blockers:
+            console.print(Text(f"  - {detail}", style="red"))
+            if remedy:
+                console.print(Text(f"      {remedy}", style="dim"))
+        console.print()
+        console.print(
+            Text("  `python -m jarvis run --text` works without any of this.", style="dim")
+        )
+        console.print()
+        return 1
+
+    return runner.run_voice(cfg, console)
+
+
+def _voice_blockers(cfg: Config) -> list[tuple[str, str | None]]:
+    """Checks that must pass before listening is even worth attempting.
+
+    Starting the loop and letting it explode on the first missing model would
+    technically work, but the failure would arrive after a ten-second model load
+    and would name a file rather than a fix.
     """
     report = run_health_checks(cfg)
-    mode = "text REPL" if text_mode else "voice loop"
-    console.print()
-    console.print(Text(f"  The {mode} is not built yet.", style="bold yellow"))
-    console.print(
-        "  Milestone 1 delivers the skeleton and this health check. The voice loop\n"
-        "  arrives in milestone 2, the brain in milestone 3.\n"
+    required = (
+        "audio.backend",
+        "audio.input",
+        "audio.output",
+        "wake.package",
+        "wake.model",
+        "stt.package",
+        "stt.model",
+        "tts.engine",
+        "tts.voice",
     )
-    console.print(Text("  Current readiness:", style="bold"))
-    for name, (available, why) in report.capabilities.items():
-        marker = "[ ok ]" if available else "[ -- ]"
-        console.print(f"  {marker}  {name}  ", end="")
-        console.print(Text(why, style="dim"))
-    console.print()
-    console.print(Text("  Run `python -m jarvis health` for the full report.", style="dim"))
-    console.print()
-    return 0
+    blockers: list[tuple[str, str | None]] = []
+    for check_id in required:
+        check = report.by_id(check_id)
+        if check is not None and check.status is Status.FAIL:
+            blockers.append((f"{check.name}: {check.detail}", check.remedy))
+    return blockers
 
 
 if __name__ == "__main__":  # pragma: no cover

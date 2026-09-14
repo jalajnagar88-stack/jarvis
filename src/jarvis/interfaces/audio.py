@@ -88,6 +88,20 @@ class AudioInput(ABC):
         is called.
         """
 
+    @abstractmethod
+    def flush(self) -> int:
+        """Discard any audio buffered since it was last read.
+
+        The microphone keeps recording while JARVIS transcribes and speaks. That
+        buffered audio is stale by the time the loop comes back around, and
+        feeding it to the wake detector would replay the user's own command --
+        or JARVIS's own voice -- as fresh input. Call this before returning to
+        idle.
+
+        Returns:
+            How many blocks were discarded. Useful for logging.
+        """
+
     def __enter__(self) -> AudioInput:
         self.start()
         return self

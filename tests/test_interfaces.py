@@ -61,11 +61,25 @@ class TestContracts:
         assert not undocumented, f"{cls.__name__}: {undocumented}"
 
     def test_importing_interfaces_pulls_in_no_heavy_dependency(self) -> None:
-        """The health check imports this; it must not cost a torch load."""
+        """The health check imports this; it must not cost a torch load.
+
+        Checked in a fresh interpreter: asserting against this process's
+        sys.modules would only prove that no earlier test happened to import
+        them, which several legitimately do.
+        """
+        import subprocess
         import sys
 
-        for heavy in ("torch", "faster_whisper", "openwakeword", "sounddevice"):
-            assert heavy not in sys.modules
+        probe = (
+            "import sys, jarvis.interfaces, jarvis.config, jarvis.health; "
+            "heavy = [m for m in ('torch', 'faster_whisper', 'openwakeword', "
+            "'sounddevice', 'sentence_transformers', 'piper') if m in sys.modules]; "
+            "print(','.join(heavy))"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", probe], capture_output=True, text=True, check=True
+        )
+        assert result.stdout.strip() == "", f"eagerly imported: {result.stdout.strip()}"
 
     def test_public_api_is_exported(self) -> None:
         for name in interfaces.__all__:
