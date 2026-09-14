@@ -255,6 +255,32 @@ Adding one is a single file under `src/jarvis/tools/builtin/`: a pydantic model
 for the arguments, a function, a decorator. The JSON schema is generated from
 the model, so it cannot drift from the code that reads it.
 
+## Memory
+
+JARVIS keeps two things in a local SQLite file: an append-only transcript, and
+short durable facts about you. After each exchange a cheap background call
+decides whether anything is worth keeping — preferences, names, standing
+instructions — and stores it with an embedding. On each turn the most relevant
+few are retrieved and put into the system prompt.
+
+You can correct it out loud: "remember that I prefer metric" and "forget that my
+sister is called Priya" both work. To see everything it has:
+
+```bash
+uv run python -m jarvis facts              # list what it remembers
+uv run python -m jarvis facts --forget-all # delete the lot (asks first)
+```
+
+Memory that cannot be inspected is memory you cannot trust, which is why that is
+a command rather than an invitation to open SQLite by hand.
+
+Without `--extra memory` it still works, retrieving by keyword instead of by
+meaning. Extraction is deliberately conservative — a memory full of "asked about
+the weather" is worse than an empty one, because it crowds out what matters and
+makes every later recall noisier. Forgetting is stricter still: an ambiguous
+request removes nothing, since you can repeat a fact it failed to forget but
+cannot recover one it forgot by mistake.
+
 ## Safety
 
 These are enforced in code, not in configuration, and cannot be turned off from
@@ -325,8 +351,8 @@ function there. Nothing else needs to know.
 | 2 | Voice loop with no brain: wake -> record -> transcribe -> speak back | **Done** |
 | 3 | Brain: streaming Anthropic client, speak on first sentence | **Done** |
 | 4 | Tools: time, weather, web search, shell, files, timers, notes, OS control | **Done** |
-| 5 | Memory: SQLite facts with embeddings, injected each turn | Next |
-| 6 | Interrupt handling: barge-in cuts TTS immediately | |
+| 5 | Memory: SQLite facts with embeddings, injected each turn | **Done** |
+| 6 | Interrupt handling: barge-in cuts TTS immediately | Next |
 | 7 | Polish: always-on-top status window and live transcript | |
 
 ## Licence

@@ -14,6 +14,7 @@ the HTTP stream. There is no cancellation flag to get wrong.
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import Generator, Iterator
 from typing import Any
 
@@ -44,15 +45,17 @@ class AnthropicBrain(Brain):
         cfg: Config,
         *,
         dispatcher: Any = None,
-        fact_provider: Any = None,
+        memory: Any = None,
+        extractor: Any = None,
     ) -> None:
         self._cfg = cfg
         self._client: Any = None
         self._messages: list[dict[str, Any]] = []
         self._dispatcher = dispatcher
         self._decisions: dict[str, bool] = {}
-        # Populated in milestone 5; the prompt builder already accepts facts.
-        self._fact_provider = fact_provider
+        self._memory = memory
+        self._extractor = extractor
+        self._session_id = uuid.uuid4().hex[:12]
 
     # -- lifecycle ---------------------------------------------------------- #
 
@@ -126,7 +129,7 @@ class AnthropicBrain(Brain):
 
     def _build_request(self, messages: list[dict[str, Any]], user_text: str) -> dict[str, Any]:
         """Assemble the request body for one leg of a turn."""
-        facts = self._fact_provider(user_text) if self._fact_provider is not None else None
+        facts = self._recall(user_text)
 
         request: dict[str, Any] = {
             "model": self._cfg.llm.model,
@@ -349,6 +352,27 @@ class AnthropicBrain(Brain):
             detail=f"stop_reason=refusal category={category}",
         )
 
+    def _recall(self, user_text: str) -> list[str] | None:
+        """The stored facts most relevant to this turn.
+
+        Never lets a memory failure break a conversation: JARVIS with no recall
+        is far better than JARVIS that stops answering.
+        """
+        if self._memory is None:
+            return None
+        try:
+            facts = self._memory.recall(
+                user_text,
+                top_k=self._cfg.memory.top_k,
+                min_similarity=self._cfg.memory.min_similarity,
+            )
+        except Exception as exc:
+            log.error("Could not recall facts (%r); continuing without them.", exc)
+            return None
+        if facts:
+            log.debug("Recalled %d fact(s) for this turn.", len(facts))
+        return [fact.text for fact in facts]
+
     def _remember_exchange(self, user_text: str, reply: str) -> None:
         """Append the exchange to the working conversation.
 
@@ -360,6 +384,17 @@ class AnthropicBrain(Brain):
             return
         self._messages.append({"role": "user", "content": user_text})
         self._messages.append({"role": "assistant", "content": reply})
+
+        if self._memory is not None:
+            try:
+                self._memory.add_message("user", user_text, session_id=self._session_id)
+                self._memory.add_message("assistant", reply, session_id=self._session_id)
+            except Exception as exc:
+                log.error("Could not write to the transcript (%r).", exc)
+
+        if self._extractor is not None:
+            # Background: the user should not wait for this.
+            self._extractor.consider(user_text, reply)
 
     def _failure(self, exc: Exception) -> AgentFailed:
         from jarvis.errors import JarvisError

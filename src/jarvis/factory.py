@@ -79,7 +79,34 @@ def build_brain(
         memory=memory,
         timers=timers,
     )
-    return AnthropicBrain(cfg, dispatcher=dispatcher)
+    extractor = build_extractor(cfg, memory) if memory is not None else None
+    return AnthropicBrain(cfg, dispatcher=dispatcher, memory=memory, extractor=extractor)
+
+
+def build_memory(cfg: Config) -> Any:
+    """Build the memory store, with embeddings when they are available.
+
+    Never fails for want of an embedding model: recall falls back to keyword
+    matching, which is worse but perfectly usable.
+    """
+    from jarvis.memory.embeddings import SentenceTransformerEmbedder
+    from jarvis.memory.store import SqliteMemory
+
+    embedder = SentenceTransformerEmbedder(
+        cfg.memory.embedding_model, cfg.memory.embedding_model_dir
+    )
+    store = SqliteMemory(
+        cfg.memory.db_path, embedder=embedder, min_similarity=cfg.memory.min_similarity
+    )
+    store.initialise()
+    return store
+
+
+def build_extractor(cfg: Config, memory: Any) -> Any:
+    """Background fact extraction after each exchange."""
+    from jarvis.memory.extraction import FactExtractor
+
+    return FactExtractor(cfg, memory)
 
 
 def build_timers(announce: Any = None) -> Any:

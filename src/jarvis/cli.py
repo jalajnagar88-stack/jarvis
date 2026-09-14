@@ -91,6 +91,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     speak = sub.add_parser("say", help="speak one phrase and exit (for auditioning a voice)")
     speak.add_argument("text", nargs="+", help="what to say")
+
+    facts = sub.add_parser("facts", help="show or clear what JARVIS remembers about you")
+    facts.add_argument(
+        "--forget-all", action="store_true", help="delete every remembered fact (asks first)"
+    )
     return parser
 
 
@@ -122,6 +127,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _cmd_run(cfg, console, text_mode=args.text, no_brain=args.no_brain)
     if command == "say":
         return runner.say(cfg, console, " ".join(args.text))
+    if command == "facts":
+        return _cmd_facts(cfg, console, forget_all=args.forget_all)
 
     parser.error(f"unknown command {command!r}")
 
@@ -329,6 +336,55 @@ def _cmd_devices(console: Console) -> int:
 # --------------------------------------------------------------------------- #
 # run
 # --------------------------------------------------------------------------- #
+
+
+def _cmd_facts(cfg: Config, console: Console, *, forget_all: bool) -> int:
+    """Show what JARVIS remembers.
+
+    Memory that cannot be inspected is memory the user cannot trust, so this is
+    a first-class command rather than an invitation to open SQLite.
+    """
+    memory = factory.build_memory(cfg)
+    stored = memory.all_facts()
+
+    console.print()
+    if not stored:
+        console.print(Text("  Nothing remembered yet.", style="dim"))
+        console.print()
+        return 0
+
+    if forget_all:
+        console.print(
+            Text(f"  This will delete all {len(stored)} remembered facts.", style="bold yellow")
+        )
+        try:
+            answer = console.input("  Type 'yes' to confirm > ").strip().lower()
+        except (EOFError, KeyboardInterrupt, OSError):
+            answer = ""
+        if answer != "yes":
+            console.print(Text("  Left alone.", style="dim"))
+            console.print()
+            return 0
+        for fact in stored:
+            memory.forget(fact.text)
+        console.print(Text(f"  Deleted {len(stored)} facts.", style="dim"))
+        console.print()
+        return 0
+
+    table = Table(show_header=True, header_style="bold", box=None, pad_edge=False, padding=(0, 2))
+    table.add_column("#", justify="right", width=4)
+    table.add_column("Remembered")
+    table.add_column("Source", width=10)
+    table.add_column("When", width=12)
+    for index, fact in enumerate(stored, start=1):
+        table.add_row(str(index), fact.text, fact.source, fact.created_at.strftime("%Y-%m-%d"))
+    console.print(table)
+    console.print()
+    console.print(
+        Text('  Say "forget that I ..." to remove one, or use --forget-all.', style="dim")
+    )
+    console.print()
+    return 0
 
 
 def _cmd_run(cfg: Config, console: Console, *, text_mode: bool, no_brain: bool = False) -> int:

@@ -10,7 +10,8 @@ from __future__ import annotations
 
 from collections.abc import Generator, Sequence
 from datetime import datetime
-from typing import cast
+from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -572,3 +573,87 @@ class TestToolLoop:
             and m["content"][0].get("type") == "tool_result"
             for m in trimmed[:1]
         )
+
+
+class TestMemoryIntegration:
+    """Facts in, transcript out, extraction in the background."""
+
+    @pytest.fixture
+    def store(self, tmp_path: Path):  # type: ignore[no-untyped-def]
+        from jarvis.memory.store import SqliteMemory
+
+        memory = SqliteMemory(tmp_path / "m.db")
+        memory.initialise()
+        return memory
+
+    def test_recalled_facts_reach_the_system_prompt(
+        self, keyed: Config, store: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store.add_fact("the user's sister is called Priya")
+        fake = FakeAnthropic()
+        fake_anthropic.install(monkeypatch, fake)
+
+        events_of(AnthropicBrain(keyed, memory=store), "what is my sister called")
+        assert "Priya" in fake.requests[0]["system"]
+
+    def test_irrelevant_facts_are_not_injected(
+        self, keyed: Config, store: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store.add_fact("the user's sister is called Priya")
+        fake = FakeAnthropic()
+        fake_anthropic.install(monkeypatch, fake)
+
+        events_of(AnthropicBrain(keyed, memory=store), "what is the capital of Peru")
+        assert "Priya" not in fake.requests[0]["system"]
+
+    def test_the_exchange_is_written_to_the_transcript(
+        self, keyed: Config, store: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake_anthropic.install(monkeypatch, FakeAnthropic([["Certainly."]]))
+        events_of(AnthropicBrain(keyed, memory=store), "put the kettle on")
+
+        texts = [m.text for m in store.recent_messages(10)]
+        assert texts == ["put the kettle on", "Certainly."]
+
+    def test_a_memory_failure_does_not_break_the_conversation(
+        self, keyed: Config, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """JARVIS with no recall is far better than JARVIS that stops answering."""
+
+        class BrokenMemory:
+            def recall(self, *args: Any, **kwargs: Any) -> Any:
+                raise RuntimeError("database is on fire")
+
+            def add_message(self, *args: Any, **kwargs: Any) -> Any:
+                raise RuntimeError("still on fire")
+
+        fake_anthropic.install(monkeypatch, FakeAnthropic([["Very good."]]))
+        events = events_of(AnthropicBrain(keyed, memory=BrokenMemory()), "hello")
+        assert isinstance(events[-1], TurnFinished)
+        assert events[-1].text == "Very good."
+
+    def test_extraction_is_offered_the_finished_exchange(
+        self, keyed: Config, store: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen: list[tuple[str, str]] = []
+
+        class Recorder:
+            def consider(self, user_text: str, reply: str) -> None:
+                seen.append((user_text, reply))
+
+        fake_anthropic.install(monkeypatch, FakeAnthropic([["Noted."]]))
+        events_of(AnthropicBrain(keyed, memory=store, extractor=Recorder()), "I prefer metric")
+        assert seen == [("I prefer metric", "Noted.")]
+
+    def test_a_failed_turn_is_not_offered_for_extraction(
+        self, keyed: Config, store: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen: list[tuple[str, str]] = []
+
+        class Recorder:
+            def consider(self, user_text: str, reply: str) -> None:
+                seen.append((user_text, reply))
+
+        fake_anthropic.install(monkeypatch, FakeAnthropic(raise_on_call=RuntimeError("x")))
+        events_of(AnthropicBrain(keyed, memory=store, extractor=Recorder()), "hello")
+        assert seen == []

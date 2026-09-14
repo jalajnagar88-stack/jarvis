@@ -71,7 +71,10 @@ def forget_this(args: ForgetArgs, ctx: ToolContext) -> str:
         removed=[fact.text for fact in removed],
     )
     if not removed:
-        return "I had nothing remembered that matched that."
+        return (
+            "I found nothing specific enough to forget. Ask the user to say more "
+            "precisely what they want removed."
+        )
     if len(removed) == 1:
         return f"Forgotten: {removed[0].text}"
     return f"Forgotten {len(removed)} things, including: {removed[0].text}"

@@ -203,3 +203,48 @@ class TestGracefulDegradation:
         out = capsys.readouterr().out
         assert "Traceback" not in out
         assert "To fix" in out
+
+
+class TestFactsCommand:
+    def test_an_empty_memory_says_so(
+        self, config_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert main(["--config", str(config_path), "facts"]) == 0
+        assert "Nothing remembered yet" in capsys.readouterr().out
+
+    def test_stored_facts_are_listed(self, cfg: Config, capsys: pytest.CaptureFixture[str]) -> None:
+        from jarvis.memory.store import SqliteMemory
+
+        memory = SqliteMemory(cfg.memory.db_path)
+        memory.initialise()
+        memory.add_fact("the user's sister is called Priya", source="explicit")
+        memory.close()
+
+        assert main(["--config", str(cfg.source_path), "facts"]) == 0
+        out = capsys.readouterr().out
+        assert "Priya" in out
+        assert "explicit" in out
+
+    def test_forget_all_requires_typing_yes(
+        self,
+        cfg: Config,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Deleting everything is irreversible; a stray keypress must not do it."""
+        from rich.console import Console
+
+        from jarvis.memory.store import SqliteMemory
+
+        memory = SqliteMemory(cfg.memory.db_path)
+        memory.initialise()
+        memory.add_fact("the user prefers tea")
+        memory.close()
+
+        monkeypatch.setattr(Console, "input", lambda self, prompt="": "y")
+        assert main(["--config", str(cfg.source_path), "facts", "--forget-all"]) == 0
+        assert "Left alone" in capsys.readouterr().out
+
+        reopened = SqliteMemory(cfg.memory.db_path)
+        reopened.initialise()
+        assert reopened.count_facts() == 1
