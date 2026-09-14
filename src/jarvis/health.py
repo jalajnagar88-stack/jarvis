@@ -889,6 +889,35 @@ def _check_logging(cfg: Config) -> Iterator[Check]:
         )
 
 
+def _check_ui(cfg: Config) -> Iterator[Check]:
+    if cfg.ui.mode == "none":
+        yield Check(
+            "ui.mode",
+            "Interface",
+            "Status display",
+            Status.SKIP,
+            "disabled (ui.mode: none) -- try `--ui tui`",
+        )
+        return
+    if cfg.ui.mode == "window" and not _importable("tkinter"):
+        yield Check(
+            "ui.mode",
+            "Interface",
+            "Status display",
+            Status.WARN,
+            "ui.mode is 'window' but tkinter is not available; JARVIS will run without a display.",
+            remedy="Set ui.mode: tui for a terminal panel instead.",
+        )
+        return
+    yield Check(
+        "ui.mode",
+        "Interface",
+        "Status display",
+        Status.OK,
+        f"{cfg.ui.mode}, {cfg.ui.transcript_lines} transcript lines",
+    )
+
+
 def _check_privacy(cfg: Config) -> Iterator[Check]:
     """State the privacy posture as a check so it is impossible to miss."""
     cloud_tts = cfg.tts.engine != "piper"
@@ -926,6 +955,7 @@ _SECTIONS = (
     _check_memory,
     _check_tools,
     _check_logging,
+    _check_ui,
     _check_privacy,
 )
 

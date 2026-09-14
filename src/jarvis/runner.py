@@ -35,6 +35,7 @@ from jarvis.logging_setup import get_logger
 from jarvis.loop import TurnResult, VoiceLoop
 from jarvis.state import State
 from jarvis.tools.confirm import is_affirmative
+from jarvis.ui.base import NullDisplay, StatusDisplay
 
 log = get_logger("runner")
 
@@ -50,11 +51,15 @@ _STATE_STYLE = {
 def run_voice(cfg: Config, console: Console, *, brain: Brain | None = None) -> int:
     """Run the wake-word voice loop until interrupted."""
     audit = AuditLog(cfg.logging.audit_file)
+    display = factory.build_display(cfg)
 
     try:
         timers = factory.build_timers()
+        memory = factory.build_memory(cfg)
         thinker = (
-            brain if brain is not None else factory.build_brain(cfg, audit=audit, timers=timers)
+            brain
+            if brain is not None
+            else factory.build_brain(cfg, audit=audit, memory=memory, timers=timers)
         )
         synthesizer = factory.build_synthesizer(cfg)
         synthesizer.load()
@@ -79,11 +84,12 @@ def run_voice(cfg: Config, console: Console, *, brain: Brain | None = None) -> i
         synthesizer=synthesizer,
         brain=thinker,
         audit=audit,
-        on_state=lambda state: _print_state(console, state),
-        on_turn=lambda turn: _print_turn(console, turn),
-        on_confirmation=lambda event: _print_confirmation(console, event),
-        on_tool=lambda name, ok: _print_tool(console, name, ok),
-        on_interrupt=lambda: console.print(Text("  [interrupted]", style="dim")),
+        on_state=lambda state: _on_state(console, display, state),
+        on_turn=lambda turn: _on_turn(console, display, turn),
+        on_reply_delta=lambda text: _on_reply_delta(display, text),
+        on_confirmation=lambda event: _on_confirmation(console, display, event),
+        on_tool=lambda name, ok: _on_tool(console, display, name, ok),
+        on_interrupt=lambda: _on_interrupt(console, display),
     )
     # A timer that fires while JARVIS is idle should say so out loud.
     timers.announce_with(loop.speak)
@@ -97,12 +103,14 @@ def run_voice(cfg: Config, console: Console, *, brain: Brain | None = None) -> i
     console.print()
 
     try:
-        with audio_in, audio_out:
+        with audio_in, audio_out, display:
             loop.run()
     except JarvisError as exc:
         return _report(console, exc)
     except KeyboardInterrupt:
         pass
+    finally:
+        display.stop()
 
     console.print()
     console.print(Text("  Stopped.", style="dim"))
@@ -121,8 +129,11 @@ def run_text(cfg: Config, console: Console, *, brain: Brain | None = None) -> in
 
     try:
         timers = factory.build_timers()
+        memory = factory.build_memory(cfg)
         thinker = (
-            brain if brain is not None else factory.build_brain(cfg, audit=audit, timers=timers)
+            brain
+            if brain is not None
+            else factory.build_brain(cfg, audit=audit, memory=memory, timers=timers)
         )
     except JarvisError as exc:
         return _report(console, exc)
@@ -316,6 +327,50 @@ def _print_remedy(console: Console, detail: str) -> None:
 def _spoken_wake_word(cfg: Config) -> str:
     """Turn a model name like `hey_jarvis` into something you can read aloud."""
     return cfg.wake_word.model.replace("_", " ")
+
+
+def _on_state(console: Console, display: StatusDisplay, state: State) -> None:
+    display.set_state(state)
+    if isinstance(display, NullDisplay):
+        _print_state(console, state)
+
+
+def _on_reply_delta(display: StatusDisplay, text: str) -> None:
+    """Accumulate the streaming reply into the display's pending line."""
+    _PENDING.append(text)
+    display.set_pending("jarvis", "".join(_PENDING))
+
+
+_PENDING: list[str] = []
+
+
+def _on_turn(console: Console, display: StatusDisplay, turn: TurnResult) -> None:
+    _PENDING.clear()
+    if turn.transcript is not None and not turn.transcript.is_empty:
+        display.add_line("you", turn.transcript.text)
+    if turn.reply:
+        display.add_line("jarvis", turn.reply)
+    if isinstance(display, NullDisplay):
+        _print_turn(console, turn)
+
+
+def _on_confirmation(console: Console, display: StatusDisplay, event: ConfirmationRequired) -> None:
+    display.note(event.prompt)
+    _print_confirmation(console, event)
+
+
+def _on_tool(console: Console, display: StatusDisplay, name: str, ok: bool | None) -> None:
+    if ok is None:
+        display.note(f"running {name}")
+    if isinstance(display, NullDisplay):
+        _print_tool(console, name, ok)
+
+
+def _on_interrupt(console: Console, display: StatusDisplay) -> None:
+    _PENDING.clear()
+    display.note("interrupted")
+    if isinstance(display, NullDisplay):
+        console.print(Text("  [interrupted]", style="dim"))
 
 
 def _print_state(console: Console, state: State) -> None:

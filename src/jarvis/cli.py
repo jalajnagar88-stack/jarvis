@@ -88,6 +88,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="echo what you said instead of thinking about it; needs no API key",
     )
+    run.add_argument(
+        "--ui",
+        choices=["none", "tui", "window"],
+        help="status display: a terminal panel, an always-on-top window, or neither",
+    )
 
     speak = sub.add_parser("say", help="speak one phrase and exit (for auditioning a voice)")
     speak.add_argument("text", nargs="+", help="what to say")
@@ -124,6 +129,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if command == "devices":
         return _cmd_devices(console)
     if command == "run":
+        if args.ui is not None:
+            cfg.ui.mode = args.ui
         return _cmd_run(cfg, console, text_mode=args.text, no_brain=args.no_brain)
     if command == "say":
         return runner.say(cfg, console, " ".join(args.text))

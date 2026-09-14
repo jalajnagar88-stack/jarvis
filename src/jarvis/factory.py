@@ -109,6 +109,29 @@ def build_extractor(cfg: Config, memory: Any) -> Any:
     return FactExtractor(cfg, memory)
 
 
+def build_display(cfg: Config) -> Any:
+    """Build the status display named in config.
+
+    Never fails: a display that cannot open falls back to showing nothing, since
+    a missing window is no reason to stop listening.
+    """
+    from jarvis.ui.base import NullDisplay
+
+    if cfg.ui.mode == "tui":
+        from jarvis.ui.tui import TerminalDisplay
+
+        return TerminalDisplay(name=cfg.general.name, max_lines=cfg.ui.transcript_lines)
+    if cfg.ui.mode == "window":
+        from jarvis.ui.window import WindowDisplay
+
+        return WindowDisplay(
+            name=cfg.general.name,
+            max_lines=cfg.ui.transcript_lines,
+            always_on_top=cfg.ui.always_on_top,
+        )
+    return NullDisplay()
+
+
 def build_timers(announce: Any = None) -> Any:
     """Background timer service for the set_timer tool."""
     from jarvis.tools.builtin.clock import TimerService

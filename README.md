@@ -166,6 +166,20 @@ microphone. Replies are still spoken aloud, so it is also the quickest way to
 audition a voice. If no speaker is available either, it degrades to printing
 rather than failing.
 
+### Watching what it is doing
+
+```bash
+uv run python -m jarvis run --ui tui      # a panel in the terminal
+uv run python -m jarvis run --ui window   # a small always-on-top window
+```
+
+Both show the current state — idle, listening, thinking, speaking — and a live
+transcript, including the reply as it streams in and a note when a tool runs.
+The terminal panel is the more portable of the two: it works over SSH and needs
+nothing installed. Set `ui.mode` in `config.yaml` to make either the default.
+
+Neither is on by default. This is a voice interface; a window is opt-in.
+
 ### Interrupting it
 
 Start talking while JARVIS is speaking and it stops mid-word and listens. You do
@@ -373,7 +387,7 @@ function there. Nothing else needs to know.
 | 4 | Tools: time, weather, web search, shell, files, timers, notes, OS control | **Done** |
 | 5 | Memory: SQLite facts with embeddings, injected each turn | **Done** |
 | 6 | Interrupt handling: barge-in cuts TTS immediately | **Done** |
-| 7 | Polish: always-on-top status window and live transcript | Next |
+| 7 | Polish: always-on-top status window and live transcript | **Done** |
 
 ## Licence
 
