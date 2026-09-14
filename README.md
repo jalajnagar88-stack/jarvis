@@ -389,6 +389,12 @@ function there. Nothing else needs to know.
 | 6 | Interrupt handling: barge-in cuts TTS immediately | **Done** |
 | 7 | Polish: always-on-top status window and live transcript | **Done** |
 
+All seven are built. What has *not* been exercised is the physical layer: no
+microphone, speaker, or GPU exists in the environment this was written in, and
+the Anthropic API was mocked throughout rather than called. The test suite
+covers the logic around all of it; you are the first to run it against real
+hardware and a real key.
+
 ## Licence
 
 MIT.
