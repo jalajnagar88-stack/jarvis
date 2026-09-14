@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# uv
+uv.lock.bak
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Secrets — never commit
+.env
+.env.local
+
+# Runtime state (all local, all private)
+var/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+logs/
+*.log
+
+# Downloaded models (hundreds of MB — fetch with scripts/download_models.sh)
+models/
+
+# Workspace the file tools are sandboxed to
+workspace/
+
+# macOS
+.DS_Store

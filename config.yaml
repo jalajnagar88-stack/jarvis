@@ -1,0 +1,331 @@
+# =============================================================================
+# JARVIS configuration
+# =============================================================================
+# Every option is listed with its default and an explanation. Secrets do NOT
+# live here — they come from `.env` (see `.env.example`). This file is safe to
+# commit; `.env` is not.
+#
+# Paths may use `~` and are resolved relative to this file's directory.
+# =============================================================================
+
+general:
+  # What the assistant calls itself. Used in the system prompt and the UI.
+  name: JARVIS
+
+  # Personality/voice instructions prepended to the system prompt. Keep it
+  # short — it is sent on every turn.
+  persona: >-
+    You are JARVIS, a calm, precise British butler. You are concise by default:
+    a spoken reply is one or two sentences unless more is genuinely required.
+    You never narrate what you are about to do; you simply do it and report the
+    result. You address the user as "sir" sparingly, not every sentence.
+
+  # IANA timezone used by get_time and the timer tool.
+  # `null` means "ask the operating system".
+  timezone: null
+
+  # metric | imperial — affects how the weather tool phrases temperatures.
+  units: metric
+
+# -----------------------------------------------------------------------------
+# Audio I/O (sounddevice / PortAudio)
+# -----------------------------------------------------------------------------
+audio:
+  # Input/output device. `null` uses the OS default. Run
+  # `python -m jarvis devices` to list devices by index and name.
+  # Accepts either an integer index or a substring of the device name.
+  input_device: null
+  output_device: null
+
+  # Capture sample rate in Hz. 16000 is what both openWakeWord and
+  # faster-whisper expect; changing it forces a resample on every chunk.
+  sample_rate: 16000
+
+  # Mono. Neither the wake word model nor Whisper uses a second channel.
+  channels: 1
+
+  # Frames per callback. 1280 frames @ 16 kHz = 80 ms, which is the chunk size
+  # openWakeWord is trained on. Lower means more responsive but more CPU.
+  block_size: 1280
+
+  # End-of-speech detection while recording a command (milestone 2).
+  silence:
+    # RMS amplitude (0.0–1.0) below which a block counts as silence. Raise this
+    # in a noisy room; lower it if JARVIS cuts you off mid-sentence.
+    threshold: 0.015
+    # How long the silence must persist before we stop recording, in seconds.
+    duration_seconds: 0.8
+    # Hard ceiling on a single utterance, in seconds. Prevents a stuck mic from
+    # recording forever.
+    max_utterance_seconds: 20.0
+    # Minimum recording length. Guards against a cough triggering a transcript.
+    min_utterance_seconds: 0.4
+
+# -----------------------------------------------------------------------------
+# Wake word (openWakeWord — fully offline, no API key)
+# -----------------------------------------------------------------------------
+wake_word:
+  # Set false to skip wake-word detection entirely (push-to-talk / text mode).
+  enabled: true
+
+  # Pretrained openWakeWord model name. Bundled options include:
+  #   hey_jarvis, alexa, hey_mycroft, hey_rhasspy, timer, weather
+  # A custom phrase requires training your own model — see README.
+  model: hey_jarvis
+
+  # Directory holding the downloaded .onnx/.tflite model files.
+  model_dir: ./models/openwakeword
+
+  # Detection confidence 0.0–1.0. Higher = fewer false wakes, more missed ones.
+  # 0.5 is the openWakeWord default; 0.6–0.7 suits a noisy room.
+  threshold: 0.5
+
+  # Seconds to ignore further detections after a wake. Stops one utterance of
+  # "hey jarvis" from firing three times.
+  cooldown_seconds: 2.0
+
+  # Inference backend: onnx | tflite. onnx is the portable default and is what
+  # works on Apple Silicon.
+  framework: onnx
+
+# -----------------------------------------------------------------------------
+# Speech to text (faster-whisper, running locally)
+# -----------------------------------------------------------------------------
+stt:
+  engine: faster_whisper
+
+  # tiny.en | base.en | small.en | medium.en | large-v3
+  # base.en is the sweet spot for a voice assistant: ~140 MB, real-time on an
+  # M-series CPU, and accurate enough for command phrasing.
+  model: base.en
+
+  # Where CTranslate2 caches the converted model.
+  model_dir: ./models/whisper
+
+  # cpu | cuda | auto. On Apple Silicon this must be `cpu`: CTranslate2 has no
+  # Metal/MPS backend, so `cuda` will fail and `auto` resolves to `cpu`.
+  device: cpu
+
+  # int8 is ~2x faster than float32 on CPU with negligible accuracy loss for
+  # base.en. Options: int8 | int8_float16 | float16 | float32
+  compute_type: int8
+
+  # Threads for CPU inference. `null` lets CTranslate2 choose.
+  cpu_threads: null
+
+  # Force a language instead of autodetecting. The `.en` models are
+  # English-only anyway, so this mainly saves a detection pass.
+  language: en
+
+  # Higher beam = slightly better accuracy, slower. 1 (greedy) is fine for
+  # short commands; 5 is the Whisper default.
+  beam_size: 1
+
+  # Drop transcripts whose average log-probability is below this. Filters out
+  # confident-sounding hallucinations from silence.
+  min_logprob: -1.0
+
+# -----------------------------------------------------------------------------
+# The brain (Anthropic API)
+# -----------------------------------------------------------------------------
+llm:
+  provider: anthropic
+
+  # Current generation. Alternatives, cheapest to most capable:
+  #   claude-haiku-4-5   — fastest, weakest tool reasoning
+  #   claude-sonnet-5    — default; 1M context, $2/$10 per Mtok
+  #   claude-opus-5      — best judgment, noticeably higher latency
+  model: claude-sonnet-5
+
+  # Ceiling on a single reply. Spoken answers are short; this mostly bounds
+  # runaway tool-use loops.
+  max_tokens: 2048
+
+  # Stream tokens so TTS can start on the first complete sentence (milestone 3).
+  # Turning this off makes replies feel roughly a second slower.
+  streaming: true
+
+  # Reasoning depth: low | medium | high | xhigh | max.
+  # `low` is deliberate here — a voice assistant is latency-bound and you are
+  # standing there waiting. Raise it if JARVIS fumbles multi-step tool use.
+  effort: low
+
+  # adaptive | disabled. `adaptive` lets the model think when a request
+  # warrants it and skip it when one doesn't.
+  thinking: adaptive
+
+  # Give up on a single API call after this many seconds.
+  timeout_seconds: 60
+
+  # Retries on 429/5xx/connection errors before surfacing a spoken apology.
+  max_retries: 2
+
+  # How many prior turns to keep in the working conversation. Older turns are
+  # still in SQLite; this only bounds what is re-sent each request.
+  history_turns: 20
+
+# -----------------------------------------------------------------------------
+# Text to speech
+# -----------------------------------------------------------------------------
+tts:
+  # piper (offline, default) | elevenlabs (cloud, needs a key)
+  engine: piper
+
+  piper:
+    # Voice model name. `en_GB-alan-medium` is the calm British male default.
+    # Other British options: en_GB-northern_english_male-medium,
+    # en_GB-alba-medium, en_GB-semaine-medium
+    voice: en_GB-alan-medium
+
+    # Directory containing <voice>.onnx and <voice>.onnx.json.
+    model_dir: ./models/piper
+
+    # Path to the `piper` executable. `null` uses the piper-tts Python package
+    # if it is installed, which is the normal case.
+    binary: null
+
+    # Speaking rate. >1.0 is slower, <1.0 is faster. 1.0 is the voice's native
+    # pace; 1.05 reads as slightly more measured, which suits a butler.
+    length_scale: 1.05
+
+    # Pause inserted between sentences, in seconds.
+    sentence_silence: 0.2
+
+  elevenlabs:
+    # Only used when engine is `elevenlabs`. The API key comes from .env.
+    voice_id: null
+    model_id: eleven_turbo_v2_5
+    # Note: using this sends your assistant's reply text to ElevenLabs.
+    # Piper sends nothing anywhere.
+
+# -----------------------------------------------------------------------------
+# Memory (milestone 5)
+# -----------------------------------------------------------------------------
+memory:
+  # SQLite file holding `messages` and `facts`. Never leaves the machine.
+  db_path: ./var/jarvis.db
+
+  # sentence-transformers model used to embed facts for recall.
+  # all-MiniLM-L6-v2 is 90 MB and fast on CPU.
+  embedding_model: all-MiniLM-L6-v2
+  embedding_model_dir: ./models/embeddings
+
+  # How many remembered facts to inject into the system prompt each turn.
+  top_k: 5
+
+  # Cosine-similarity floor. Facts below this are not considered relevant.
+  min_similarity: 0.35
+
+  # Background fact extraction after each exchange.
+  extraction:
+    enabled: true
+    # A cheap model is deliberate — this runs after every single turn.
+    model: claude-haiku-4-5
+    max_tokens: 512
+
+# -----------------------------------------------------------------------------
+# Tools (milestone 4)
+# -----------------------------------------------------------------------------
+tools:
+  # Only tools named here are exposed to the model. Comment one out to remove
+  # the capability entirely — it will not appear in the tool schema at all.
+  enabled:
+    - get_time
+    - get_weather
+    - web_search
+    - run_shell
+    - read_file
+    - write_file
+    - set_timer
+    - add_note
+    - open_app
+    - control_volume
+    - remember_this
+    - forget_this
+
+  # Absolute ceiling on tool-call rounds in one turn. Stops a loop from
+  # running up a bill while you listen to silence.
+  max_iterations: 8
+
+  # --- Filesystem sandbox -----------------------------------------------------
+  filesystem:
+    # read_file and write_file cannot escape this directory. The path is
+    # resolved (symlinks followed) and checked before every operation, so
+    # `../../etc/passwd` and a symlink pointing outside both fail.
+    workspace: ./workspace
+    # Refuse to read or write anything larger than this, in megabytes.
+    max_file_mb: 10
+
+  # --- Shell ------------------------------------------------------------------
+  shell:
+    # Every command is shown in full and must be confirmed out loud or typed
+    # before it runs. There is no way to turn this off from config — it is
+    # enforced in code.
+    require_confirmation: true
+    # Kill a command that runs longer than this, in seconds.
+    timeout_seconds: 30
+    # Working directory for shell commands. Defaults to the workspace.
+    cwd: ./workspace
+    # Patterns blocked outright, with no confirmation path offered. These are
+    # matched against the normalised command string. Additions here are
+    # additive — the built-in denylist in jarvis/tools/safety.py always applies.
+    extra_denylist: []
+
+  # --- Weather (Open-Meteo, no API key) ---------------------------------------
+  weather:
+    # Default location when you don't name one. `null` means JARVIS will ask.
+    default_latitude: null
+    default_longitude: null
+    default_location_name: null
+
+  # --- Web search (Anthropic server-side tool) --------------------------------
+  web_search:
+    # Cap searches per turn so one question can't fan out indefinitely.
+    max_uses: 3
+    # Optional domain restrictions. Set at most one of these, never both.
+    allowed_domains: []
+    blocked_domains: []
+
+  # --- Notes ------------------------------------------------------------------
+  notes:
+    # add_note appends to this file, inside the workspace.
+    path: notes.md
+
+# -----------------------------------------------------------------------------
+# Interrupt handling (milestone 6)
+# -----------------------------------------------------------------------------
+interrupt:
+  # Listen for speech while JARVIS is talking and cut playback when you start.
+  enabled: true
+  # RMS threshold for "the user is talking over me". Higher than the silence
+  # threshold because the speaker is feeding back into the mic.
+  threshold: 0.05
+  # How long that level must hold before we treat it as a real interruption,
+  # in seconds. Too low and a door slam stops playback.
+  min_duration_seconds: 0.25
+
+# -----------------------------------------------------------------------------
+# Status window (milestone 7)
+# -----------------------------------------------------------------------------
+ui:
+  # none | tui | window
+  mode: none
+  always_on_top: true
+  # Lines of transcript to keep visible.
+  transcript_lines: 12
+
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+logging:
+  # DEBUG | INFO | WARNING | ERROR
+  level: INFO
+  # Rotating application log. `null` disables file logging (console only).
+  file: ./logs/jarvis.log
+  max_bytes: 5242880
+  backup_count: 3
+
+  # Append-only audit trail: every tool call, every confirmation, every denial,
+  # with timestamps. Separate from the application log on purpose — this is the
+  # record of what JARVIS *did*, not what it logged.
+  audit_file: ./logs/audit.log

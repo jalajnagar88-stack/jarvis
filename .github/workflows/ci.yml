@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # Deliberately NOT installing --extra voice. The suite must pass with no
+      # microphone, no speakers, no downloaded models, and no API key — if it
+      # ever needs them, that is a bug in the test, not in the runner.
+      - name: Install
+        run: uv sync --extra dev --python ${{ matrix.python-version }}
+
+      - name: Lint
+        run: uv run ruff check src tests
+
+      - name: Format check
+        run: uv run ruff format --check src tests
+
+      - name: Type check
+        run: uv run mypy src tests
+
+      - name: Test
+        run: uv run pytest --cov --cov-report=term-missing
+
+      - name: Health check runs on a bare checkout
+        # Exit code 1 is correct here: no models are downloaded in CI. What is
+        # being asserted is that it produces a readable report rather than a
+        # stack trace.
+        run: |
+          uv run python -m jarvis health --json > /tmp/health.json || true
+          python -c "import json; d=json.load(open('/tmp/health.json')); \
+            assert d['checks'], 'no checks produced'; \
+            assert d['overall'] in {'ok','warn','fail'}; \
+            print(f\"{len(d['checks'])} checks, overall={d['overall']}\")"
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the model download script
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck scripts/download_models.sh
